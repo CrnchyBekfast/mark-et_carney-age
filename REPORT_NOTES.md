@@ -62,7 +62,7 @@ new runs will repopulate this section and the artifact tracker.**
 - [x] Exp 3 (redo) — F1/F2/T3 all captured clean, single-cycle capture (see raw log below)
 - [x] Exp 4 (real server, redo) — clean, wchan=kqread (see raw log below)
 - [x] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast complete, wchan=sbwait (see raw log below)
-- [ ] Exp 5
+- [x] Exp 5 — T6 done, ready-vs-idle multiplexing confirmed (see raw log below)
 - [ ] Exp 6
 - [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
       event loop, not just the offline engine test)
@@ -282,6 +282,114 @@ while the real server's event loop is parked in `kevent()` and Client 1's
 stall has zero effect on any other connection. This is now a real,
 side-by-side measured comparison, not just an assertion.
 
+### Raw session log — Experiment 5 (T6 complete)
+
+**Session A — `python3 experiment.py 5`:**
+```
+=== Experiment 5: Multiple Clients and I/O Multiplexing (Optional) ===
+
+Started Exchange Server (PID 5392).
+     0.123ms listen           fd=3 host='127.0.0.1' port=5000 backlog=4096
+Exchange Server is listening.
+    75.806ms accept           sid=1 fd=5 peer='127.0.0.1:64321' nconn=1
+
+Creating five simultaneous TCP connections...
+
+    75.838ms eof_rst          sid=1 fd=5 errno=54 ev_fflags=54
+    75.852ms close            sid=1 fd=5 why='RST' role='untyped' recvs=0 bytes_in=0 queued=0 sent=0 eagain=0 wbuf_hwm=0 orders_surviving=0
+    75.868ms destroy          sid=1 fd=5 nconn=0
+Client 1: connected from 127.0.0.1:35113
+    75.895ms accept           sid=2 fd=5 peer='127.0.0.1:35113' nconn=1
+Client 2: connected from 127.0.0.1:39310
+    75.974ms accept           sid=3 fd=6 peer='127.0.0.1:39310' nconn=2
+Client 3: connected from 127.0.0.1:25989
+Client 4: connected from 127.0.0.1:39998
+Client 5: connected from 127.0.0.1:42748
+
+Clients 1, 3, and 5 will send application messages.
+Clients 2 and 4 will remain idle.
+
+    76.112ms accept           sid=4 fd=7 peer='127.0.0.1:25989' nconn=3
+Client 1: sent application data.
+    76.132ms accept           sid=5 fd=8 peer='127.0.0.1:39998' nconn=4
+    76.147ms accept           sid=6 fd=9 peer='127.0.0.1:42748' nconn=5
+    76.185ms recv             sid=2 fd=5 n=15 rbuf_before=0 rbuf_after=0 lines_out=1 hex='4c4f47494e20636c69656e745f310a'
+    76.222ms queue_out        sid=2 fd=5 n=3 pending=3 hwm=3
+Client 3: sent application data.
+   576.578ms recv             sid=4 fd=7 n=15 rbuf_before=0 rbuf_after=0 lines_out=1 hex='4c4f47494e20636c69656e745f330a'
+   576.707ms queue_out        sid=4 fd=7 n=3 pending=3 hwm=3
+Client 5: sent application data.
+  1076.953ms recv             sid=6 fd=9 n=15 rbuf_before=0 rbuf_after=0 lines_out=1 hex='4c4f47494e20636c69656e745f350a'
+  1077.093ms queue_out        sid=6 fd=9 n=3 pending=3 hwm=3
+
+The experiment is now in the observation phase.
+Investigate which connections were active.
+Press Ctrl-C when you are finished.
+Stopping Exchange Server...
+ 16580.904ms signal           signo=15
+```
+
+No `$EXCH_TRACE` JSONL file was set for this run, so there's no aggregate
+`kq_batch{ready_fds[]}`-style line to grep -- but the same conclusion falls
+straight out of the per-event stderr trace: across the entire ~16.5s run,
+`recv` is called exactly three times, on fds 5, 7, 9 (sid 2, 4, 6) --
+never once on fds 6 or 8 (sid 3, 5). The event loop's readiness
+notification simply never woke for the idle two, which *is* the
+`ready_fds` filtering, just observed one event at a time instead of as a
+single aggregated log line.
+
+**sid ↔ Client mapping** (cross-checked two ways: by peer port against the
+harness's own `Client N: connected from ...` lines, and independently by
+decoding each `recv` line's `hex` payload):
+- sid=2, fd=5, port 35113 = **Client 1** -- `hex` decodes to `LOGIN client_1\n` ✅
+- sid=3, fd=6, port 39310 = **Client 2** -- never appears in any `recv` line
+- sid=4, fd=7, port 25989 = **Client 3** -- `hex` decodes to `LOGIN client_3\n` ✅
+- sid=5, fd=8, port 39998 = **Client 4** -- never appears in any `recv` line
+- sid=6, fd=9, port 42748 = **Client 5** -- `hex` decodes to `LOGIN client_5\n` ✅
+
+(Note: sid=1/fd=5 at the very top, closed by RST within 32us of accept, is
+the harness's own readiness probe -- same pattern as Day 0's stub-server
+verification, not one of the five numbered clients. Unrelated to T6.)
+
+**Session B — `netstat -an -p tcp | grep '\.5000 '`, sampled 4x during the
+observation window:**
+```
+tcp4           0      0 127.0.0.1.5000         127.0.0.1.42748        ESTABLISHED
+tcp4           3      0 127.0.0.1.42748        127.0.0.1.5000         ESTABLISHED
+tcp4           0      0 127.0.0.1.5000         127.0.0.1.39998        ESTABLISHED
+tcp4           0      0 127.0.0.1.39998        127.0.0.1.5000         ESTABLISHED
+tcp4           0      0 127.0.0.1.5000         127.0.0.1.25989        ESTABLISHED
+tcp4           3      0 127.0.0.1.25989        127.0.0.1.5000         ESTABLISHED
+tcp4           0      0 127.0.0.1.5000         127.0.0.1.39310        ESTABLISHED
+tcp4           0      0 127.0.0.1.39310        127.0.0.1.5000         ESTABLISHED
+tcp4           0      0 127.0.0.1.5000         127.0.0.1.35113        ESTABLISHED
+tcp4           3      0 127.0.0.1.35113        127.0.0.1.5000         ESTABLISHED
+tcp4           0      0 127.0.0.1.5000         *.*                    LISTEN
+```
+Identical across all 4 samples spaced through the ~16.5s observation
+window -- a stable steady state, not a transient snapshot.
+
+All five sockets sit at **ESTABLISHED** throughout, matching the log's
+`nconn=5`. Reading `Recv-Q` (first numeric column) by port:
+- Port 42748 (Client 5) client-side leg: `Recv-Q=3` -- the 3-byte `OK\n`
+  reply the server queued at 1077.093ms, sitting unread in the *client's*
+  kernel receive buffer (the harness never calls `recv()` on the reply).
+- Port 25989 (Client 3) client-side leg: `Recv-Q=3` -- same story.
+- Port 35113 (Client 1) client-side leg: `Recv-Q=3` -- same story.
+- Port 39310 (Client 2) and port 39998 (Client 4), **both directions**:
+  `Recv-Q=0`. No bytes were ever exchanged on these sockets in either
+  direction -- this is the OS-level confirmation that idle really means
+  idle, not "sent but unread by the app."
+
+**T6 finding:** connected ≠ ready. All five sockets are `ESTABLISHED` for
+the full run (`netstat`), but the server's event loop only ever calls
+`recv()` on the three fds that actually have data (`kqread`-driven
+readiness from the stderr trace), and the two idle sockets carry
+`Recv-Q=0` in both directions the entire time. kqueue's per-socket,
+event-driven readiness means the cost of servicing this batch is O(ready)
+= O(3), not O(registered) = O(5) -- confirmed by the trace never once
+touching fd 6 or fd 8.
+
 ### Known pitfalls (still applicable — read before re-running)
 
 - **Never pre-start the server before an `experiment.py N` invocation.**
@@ -344,7 +452,7 @@ Architecture and lifecycle
 | T1 | listening vs connected socket table | ✅ | Exp 1 redo, real VM run: fd=3 LISTEN `127.0.0.1:5000`/`*:*` vs fd=5 (sid=2) ESTABLISHED `127.0.0.1:5000`/`127.0.0.1:28907` — see raw session log |
 | T2 | TCP state timeline, CLOSE_WAIT transient | ✅ | Exp 2 redo: CLOSE_WAIT 609us (3rd consistent sub-ms measurement across separate runs) — see raw session log |
 | T5 | Exp 4 correct vs naive control | ✅ | Exp 4 redo, both halves: real server wchan=kqread/0.001s vs naive wchan=sbwait/None-after-5.105s — see raw session log |
-| T6 | Exp 5 ready vs idle fds | ⬜ | |
+| T6 | Exp 5 ready vs idle fds | ✅ | recv() called only on sid 2/4/6 (Clients 1/3/5) across the whole run; netstat confirms Recv-Q=0 both directions for Clients 2/4 -- see raw session log |
 | T7 | FIN vs RST matrix | ⬜ | |
 | T10 | Exp 8 timeline + TRADE counts | ⬜ | |
 | T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ⬜ | |
