@@ -450,9 +450,10 @@ Two things worth calling out precisely:
 - **Port 63936 (Part A, FIN) never showed `TIME_WAIT`** in any sample --
   it went straight from a state we caught as `CLOSED` to gone. This is the
   same fast-clearance pattern flagged in the Exp 2/3 redo notes and ties
-  directly into the still-open `net.inet.tcp.nolocaltimewait` question
-  below -- worth confirming with one more `sysctl` command before the
-  report states this as fact.
+  directly into the `net.inet.tcp.nolocaltimewait` question -- **now
+  checked and refuted** (`sysctl` returns `0` on this VM, so that specific
+  fast-clear mechanism cannot be the explanation; see the "Open questions"
+  section below for the honest framing to use in the report).
 - **Port 50690 (Part B, RST) never appeared in any of the ~13 samples at
   all**, despite polling repeatedly right around when Part B fires
   (t=10077ms). That absence *is* the finding: an RST tears down both
@@ -638,12 +639,26 @@ Architecture and lifecycle
   → decided: evict (roadmap §5) — confirm the eviction never actually
   triggers during a *normal* Exp 7 run (4 MiB is far above the ~85 KB feed);
   if it does trigger, something else is wrong.
-- Watch for Exp 2's `TIME_WAIT` behavior on the redo: previously it cleared
-  in <1s despite `msl=30000` implying a 60s hold. Leading hypothesis is
-  FreeBSD's `net.inet.tcp.nolocaltimewait` (defaults to `1`, skips full
-  `TIME_WAIT` for loopback-only connections) — check
-  `sysctl net.inet.tcp.nolocaltimewait` on the VM and confirm on this redo
-  before stating it as fact in the report.
+- **RESOLVED (hypothesis refuted) — fast/absent `TIME_WAIT` on loopback.**
+  `sysctl net.inet.tcp.nolocaltimewait` on the VM returns **`0`**, i.e. the
+  fast-clear optimization is NOT enabled (its default is commonly cited as
+  `1`, but this VM's build/config has it off). That kills the leading
+  hypothesis outright: this VM cannot be skipping `TIME_WAIT` for loopback
+  connections via that sysctl, because the knob is off. Yet Exp 2/3's
+  CLOSE_WAIT numbers and Exp 6 Part A's port 63936 both still show no
+  observable `TIME_WAIT` window in polled `netstat` output, and `msl=30000`
+  would imply a 60s hold if a real TIME_WAIT were occurring. **Do not state
+  a specific mechanism in the report** — the honest, defensible framing is:
+  "we observed no `TIME_WAIT` entry for the loopback connections we polled,
+  despite confirming `nolocaltimewait=0`; the mechanism is not fully
+  explained by our measurements, and a `netstat`/`sockstat` sampling
+  interval on the order of seconds may simply be too coarse relative to
+  the actual state transition to rule out a very brief real TIME_WAIT vs.
+  none at all." This is a case where reporting the honest, partially-
+  unexplained result is stronger than force-fitting a wrong sysctl
+  explanation -- and it's a legitimate thing to raise proactively in the
+  viva as a limitation you identified yourself rather than one that would
+  be caught.
 
 ## Things to remember to say in the viva
 
