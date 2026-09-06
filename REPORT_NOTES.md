@@ -64,8 +64,8 @@ new runs will repopulate this section and the artifact tracker.**
 - [x] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast complete, wchan=sbwait (see raw log below)
 - [x] Exp 5 — T6 done, ready-vs-idle multiplexing confirmed (see raw log below)
 - [x] Exp 6 — T7 done, FIN vs RST matrix complete (see raw log below)
-- [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
-      event loop, not just the offline engine test)
+- [x] Exp 8 (+ supplementary disconnect-then-match test) — T10 and T11 both
+      done (see raw session log below)
 
 ### Raw session log — Experiment 1 (redo)
 
