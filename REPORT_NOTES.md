@@ -60,8 +60,8 @@ new runs will repopulate this section and the artifact tracker.**
 - [x] Exp 1 (redo) — clean, T1 captured (see raw log below)
 - [x] Exp 2 (redo) — clean, T2 captured (see raw log below)
 - [x] Exp 3 (redo) — F1/F2/T3 all captured clean, single-cycle capture (see raw log below)
-- [ ] Exp 4 (real server)
-- [ ] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast
+- [x] Exp 4 (real server, redo) — clean, wchan=kqread (see raw log below)
+- [x] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast complete, wchan=sbwait (see raw log below)
 - [ ] Exp 5
 - [ ] Exp 6
 - [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
@@ -227,6 +227,61 @@ still well under 1ms and well within the same order of magnitude --
 strengthens the report claim that this is a repeatable property of the
 implementation (immediate close-on-EOF), not a single lucky measurement.
 
+### Raw session log — Experiment 4 (redo, both halves -- T5 complete)
+
+**Part 1, real server, session A:**
+```
+=== Experiment 4: One Client Should Not Stall the Others ===
+Started Exchange Server (PID 5353).
+    77.702ms accept  sid=2 fd=5 peer='127.0.0.1:27324' nconn=1
+Client 1 will now remain silent.
+    77.789ms recv    sid=2 fd=5 n=20 rbuf_before=0 rbuf_after=20 lines_out=0 hex=... -> "LOGIN blocked_client" (no \n)
+Client 2: connected from 127.0.0.1:50811
+  2082.357ms accept  sid=3 fd=6 peer='127.0.0.1:50811' nconn=2      <- ~2s after Client 1 stalled
+  2082.700ms recv    sid=3 fd=6 n=20 rbuf_before=0 rbuf_after=0 lines_out=1 hex=... -> "LOGIN active_client\n"
+  2082.853ms queue_out sid=3 fd=6 n=3 pending=3 hwm=3
+Client 2 response: 'OK'
+Elapsed time: 0.001 seconds
+```
+**Session B, live during the stall:**
+```
+$ pgrep -f server.py
+5353
+$ ps -o pid,tid,wchan,state -H -p 5353
+ PID    LWP WCHAN  STAT
+5353 100176 kqread Ss
+```
+
+**Part 2, naive control, session A:**
+```
+=== Experiment 4: One Client Should Not Stall the Others ===
+Started Exchange Server (PID 5358).
+Naive (blocking, single-threaded) server listening.
+Client 1: connected from 127.0.0.1:47150
+Client 1 will now remain silent.
+Client 2: connected from 127.0.0.1:65437
+Client 2 response: None
+Elapsed time: 5.105 seconds
+```
+**Session B, live during the stall:**
+```
+$ pgrep -f naive_server.py
+5358
+$ ps -o pid,tid,wchan,state -H -p 5358
+ PID    LWP WCHAN  STAT
+5358 100176 sbwait Ss
+```
+
+**T5 finding, complete contrast:** real server -- `wchan=kqread`, Client 2
+gets `OK` in **0.001s**. Naive server -- `wchan=sbwait`, Client 2 gets
+**`None`** (no response at all) after the harness's own **5.105s** timeout.
+One word (`kqread` vs `sbwait`) is the entire architectural proof: the
+naive server is genuinely blocked inside a socket read syscall on Client
+1's dead connection and structurally cannot reach `accept()` for Client 2,
+while the real server's event loop is parked in `kevent()` and Client 1's
+stall has zero effect on any other connection. This is now a real,
+side-by-side measured comparison, not just an assertion.
+
 ### Known pitfalls (still applicable — read before re-running)
 
 - **Never pre-start the server before an `experiment.py N` invocation.**
@@ -288,7 +343,7 @@ Architecture and lifecycle
 |---|---|---|---|
 | T1 | listening vs connected socket table | ✅ | Exp 1 redo, real VM run: fd=3 LISTEN `127.0.0.1:5000`/`*:*` vs fd=5 (sid=2) ESTABLISHED `127.0.0.1:5000`/`127.0.0.1:28907` — see raw session log |
 | T2 | TCP state timeline, CLOSE_WAIT transient | ✅ | Exp 2 redo: CLOSE_WAIT 609us (3rd consistent sub-ms measurement across separate runs) — see raw session log |
-| T5 | Exp 4 correct vs naive control | ⬜ | naive control code written + locally verified (`src/naive_server.py`, `src/tools/verify_naive_stall.py`); VM run pending |
+| T5 | Exp 4 correct vs naive control | ✅ | Exp 4 redo, both halves: real server wchan=kqread/0.001s vs naive wchan=sbwait/None-after-5.105s — see raw session log |
 | T6 | Exp 5 ready vs idle fds | ⬜ | |
 | T7 | FIN vs RST matrix | ⬜ | |
 | T10 | Exp 8 timeline + TRADE counts | ⬜ | |
