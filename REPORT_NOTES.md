@@ -604,22 +604,49 @@ produce a logged `notify_dropped`. Worth stating explicitly in the report:
 subscription cleanup is immediate and silent; order survival is
 deliberate and produces an observable drop on the next match.
 
-**Session B tcpdump (`exp8.pcap`), read back with
-`tcpdump -r exp8.pcap -n -ttt -S`:** confirms the accept/handshake and
-`SUBSCRIBE`/`LOGIN` pushes for all five connections, and the steady stream
-of `TRADE`/`BOUGHT`/`SOLD` pushes each trading cycle. The final teardown
-block (at the very end, after "Experiment finished") shows explicit FIN
-exchanges for ports 48653, 54619, and 59156 (the three survivors) but the
-capture is dense enough (hundreds of lines) that I have not yet pinned
-down port 49686's own FIN packet by eye with full confidence -- **one more
-command needed to close this out cleanly:**
-```sh
-tcpdump -r exp8.pcap -n -ttt -S | grep 49686
+**Session B tcpdump (`exp8.pcap`, in `~`, not `~/col334_a2` -- note for
+next time), read back with `tcpdump -r exp8.pcap -n -ttt -S`:** confirms
+the accept/handshake and `SUBSCRIBE`/`LOGIN` pushes for all five
+connections, and the steady stream of `TRADE`/`BOUGHT`/`SOLD` pushes each
+trading cycle. Isolating port 49686 (`| grep 49686`) gives the killed
+client's full wire history:
 ```
-Expected: a `[F.]` (or possibly `[R.]`, though the server's own
-`eof_fin`/`ev_eof=True` trace strongly implies FIN, not RST) somewhere
-around the 3.88s mark, followed by no further packets from that port.
-Pending this confirmation before T10 is marked done in the tracker.
+... (handshake, SUBSCRIBE JNST, then ACKs to each TRADE push, as expected) ...
+127.0.0.1.49686 > 127.0.0.1.5000: Flags [.], ack 4046884455, win 320, ...   <- last ACK of a TRADE push
+127.0.0.1.49686 > 127.0.0.1.5000: Flags [F.], seq 2006219560, ack 4046884455, ...   <- SIGKILL'd process's FIN
+127.0.0.1.5000  > 127.0.0.1.49686: Flags [.], ack 2006219561, ...                    server ACKs
+127.0.0.1.5000  > 127.0.0.1.49686: Flags [F.], seq 4046884455, ack 2006219561, ...   server sends its own FIN back
+127.0.0.1.49686 > 127.0.0.1.5000: Flags [.], ack 4046884456, ...                     client ACKs -- full 4-way close
+```
+This is the exact same shape as Exp 6 Part A's close (client FIN -> server
+ACK -> server's own FIN -> client ACK), and confirms the roadmap's
+prediction word for word: **SIGKILL is indistinguishable from a clean
+`close()` on the wire.** The kernel closes the dead process's file
+descriptors on exit, which for a TCP socket means a normal FIN -- there is
+no "the process died" signal at the protocol level, and the server's
+`eof_fin{ev_eof=True}` trace (not `eof_rst`) is fully consistent with what
+the capture shows. No `BrokenPipeError`/EPIPE(32) scenario appears in this
+run either, because the server never attempted a `send()` to sid=5 again
+after the FIN was detected -- detection (via `kevent()` readiness) beat
+any further write attempt, so the "write-after-death produces RST/EPIPE"
+branch the roadmap mentions as *possible* simply didn't get exercised
+here; that would require a write to be in flight at the exact moment of
+the kill, which is a timing race this run didn't happen to hit.
+
+**T10 finding, complete:** the harness's `SIGKILL` on the Market-Data
+client produces a normal FIN on the wire (confirmed above) and an
+`eof_fin` in the server trace at 3882.042ms -- detection is purely
+reactive, learned only on the next `kevent()` readiness notification for
+that fd, exactly as the roadmap predicts. `orders_surviving=0` at close
+time correctly reflects that a Market-Data client owns no orders.
+Post-kill, the buyer and seller keep trading normally and the surviving
+Market-Data client (sid=2) keeps receiving `TRADE` broadcasts without
+interruption -- one client's death has zero effect on the others (§4.4
+holds). No `notify_dropped` appears for sid=5 anywhere after the kill,
+which is the correct behavior for a *subscriber* (see the `subs[instr]`
+discard note above) and is the direct contrast to T11's Trader case, where
+a resting *order* is deliberately left in the book and does produce a
+`notify_dropped` on the next match.
 
 **Part 2 -- supplementary test (T11), the gap the harness itself doesn't
 cover.** Manual test against a freshly-started server
@@ -731,7 +758,7 @@ Architecture and lifecycle
 | T5 | Exp 4 correct vs naive control | ✅ | Exp 4 redo, both halves: real server wchan=kqread/0.001s vs naive wchan=sbwait/None-after-5.105s — see raw session log |
 | T6 | Exp 5 ready vs idle fds | ✅ | recv() called only on sid 2/4/6 (Clients 1/3/5) across the whole run; netstat confirms Recv-Q=0 both directions for Clients 2/4 -- see raw session log |
 | T7 | FIN vs RST matrix | ✅ | Exp 6, both parts: FIN = 4-way close (server EOF triggers full teardown, not half-close), RST = single segment no handshake; `ev_fflags=54` present only on RST -- see raw session log + comparison table |
-| T10 | Exp 8 timeline + TRADE counts | ⬜ | |
+| T10 | Exp 8 timeline + TRADE counts | ✅ | SIGKILL'd MD client (sid=5): `eof_fin` at 3882.042ms, `orders_surviving=0`, confirmed clean 4-way FIN close on the wire (`tcpdump | grep 49686`); buyer/seller/surviving MD client unaffected -- see raw session log |
 | T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ✅ | supplementary manual test: `close{orders_surviving=1}` for trader_a's disconnect, later `notify_dropped{target_sid=2, msg=BOUGHT...}` on the crossing trade; SOLD/TRADE delivered normally to survivors -- see raw session log |
 | T12 | errno reference table (35/32/54/60) | ⬜ | |
 | B1 | baseline.txt from the FreeBSD VM | ✅ | captured on VM: `sendspace=32768`, `recvspace=65536` (auto-tuning on), capacity 98304 B vs Exp 7's 85000 B feed → pre-flight verdict says backpressure probably won't appear at stock settings; Run B (reduced buffers) planned to force it inside the window |
