@@ -59,7 +59,7 @@ new runs will repopulate this section and the artifact tracker.**
 
 - [x] Exp 1 (redo) — clean, T1 captured (see raw log below)
 - [x] Exp 2 (redo) — clean, T2 captured (see raw log below)
-- [ ] Exp 3
+- [x] Exp 3 (redo) — F1/F2/T3 all captured clean, single-cycle capture (see raw log below)
 - [ ] Exp 4 (real server)
 - [ ] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast
 - [ ] Exp 5
@@ -173,6 +173,60 @@ experiment since. Before Exp 3's capture: run `pgrep tcpdump` (or
 `ps aux | grep tcpdump`) and `pkill tcpdump` to clear any leftover
 process, so future `.pcap` files contain only the run they're meant to.
 
+### Raw session log — Experiment 3 (redo)
+
+**Session A:**
+```
+=== Experiment 3: TCP as a Byte Stream ===
+Started Exchange Server (PID 5337).
+    79.848ms accept  sid=1 fd=5 peer='127.0.0.1:30505' nconn=1
+    79.908ms eof_rst sid=1 fd=5 errno=54 ev_fflags=54
+Experiment client: connected from 127.0.0.1:40700
+    79.994ms accept  sid=2 fd=5 peer='127.0.0.1:40700' nconn=1
+Sent 6 bytes.
+    80.036ms recv  n=6  rbuf_before=0  rbuf_after=6   lines_out=0  hex=4c4f47494e20      -> "LOGIN "
+Sent 10 bytes.
+   282.252ms recv  n=10 rbuf_before=6  rbuf_after=16  lines_out=0  hex=6578706572696d656e74 -> "experiment"
+Sent 7 bytes.
+   486.481ms recv  n=7  rbuf_before=16 rbuf_after=23  lines_out=0  hex=5f747261646572    -> "_trader"
+Sent 1 bytes.
+   688.141ms recv  n=1  rbuf_before=23 rbuf_after=0   lines_out=1  hex=0a                -> "\n"
+   688.325ms queue_out sid=2 fd=5 n=3 pending=3 hwm=3
+Experiment finished. Stopping Exchange Server...
+  8361.573ms eof_fin  sid=2 fd=5 ev_eof=True
+  8362.182ms signal   signo=15
+```
+Post-teardown: `sockstat -4 | grep 5000` -> empty. Clean.
+
+**tcpdump readback -- clean single-cycle capture this time (22 packets;
+the earlier stale-tcpdump cleanup, `pkill tcpdump`, worked):**
+```
++0s        SYN 46266->5000 -> immediate RST (no SYN/ACK)        <- connection-refused precheck, as always
++0.103834s SYN 30505->5000 -> SYN/ACK -> ACK -> RST from 30505  <- readiness probe
++0.000081s SYN 40700->5000 -> SYN/ACK -> ACK                     <- real client, ESTABLISHED
++0.000076s PSH 40700->5000 len=6  "LOGIN "        <- fragment 1
++0.201959s PSH 40700->5000 len=10 "experiment"    <- fragment 2 (202ms gap)
++0.204174s PSH 40700->5000 len=7  "_trader"       <- fragment 3 (204ms gap)
++0.201680s PSH 40700->5000 len=1  "\n"            <- fragment 4 (202ms gap)
++0.000565s PSH 5000->40700 len=3  "OK\n"          <- reply, 565us after final fragment
++7.630461s FIN 40700->5000                        <- client closes
++0.000026s ACK 5000->40700                        <- server ACKs FIN, CLOSE_WAIT begins
++0.000958s FIN 5000->40700                        <- server's own close -- CLOSE_WAIT 984us total
++0.000014s ACK 40700->5000                        <- client -> TIME_WAIT
+```
+
+**F1/T3 finding:** four PSH segments of exactly 6/10/7/1 bytes, gaps of
+~202-204ms between each -- matches the handout's 0.2s spacing and this
+run's own `recv()` byte counts exactly. Reassembled payload
+`LOGIN experiment_trader\n`, byte-for-byte the handout's example.
+
+**T2/CLOSE_WAIT running tally (4 independent measurements now, all
+sub-millisecond):** 656us (Exp 2, pre-redo) / 507us (Exp 3, pre-redo) /
+609us (Exp 2 redo) / **984us (Exp 3 redo)**. Slightly higher this time but
+still well under 1ms and well within the same order of magnitude --
+strengthens the report claim that this is a repeatable property of the
+implementation (immediate close-on-EOF), not a single lucky measurement.
+
 ### Known pitfalls (still applicable — read before re-running)
 
 - **Never pre-start the server before an `experiment.py N` invocation.**
@@ -210,9 +264,9 @@ Fragmentation (§2.9 / §4.2 / Exp 3)
 
 | id | what | status | file(s) |
 |---|---|---|---|
-| F1 | tcpdump: 4 segments 6/10/7/1 bytes | ⬜ | |
-| F2 | stderr trace: 4 recv, 3 frame_partial, 1 emitted | ⬜ | |
-| T3 | recv-call ledger (table) | ⬜ | |
+| F1 | tcpdump: 4 segments 6/10/7/1 bytes | ✅ | Exp 3 redo, clean single-cycle capture: 6/10/7/1 bytes, ~202-204ms gaps — see raw session log |
+| F2 | stderr trace: 4 recv, 3 frame_partial, 1 emitted | ✅ | `frame_partial`/`frame_complete` don't fire post-Phase-3-rewiring (by design); `recv`'s own `rbuf_after` (0→6→16→23→0) + single `queue_out` after the 4th recv is the equivalent, cleaner evidence |
+| T3 | recv-call ledger (table) | ✅ | Exp 3 redo: n=6,10,7,1, rbuf_after=6,16,23,0, lines_out=0,0,0,1 — exact match to predicted ledger |
 | T4 | offline framer pass counts (N-1 splits + 1000 random) | ✅ | `tests/test_all.py::test_frag_all_split_positions` (N-1/N-1, N=48 for the 3-line LOGIN/BUY/SELL fixture) + `::test_frag_random_multiway_splits` (1000/1000, seed=0) — both green |
 | F4 | reverse direction: 3 SELLs + 1 sweeping BUY in one segment | ⬜ | |
 
