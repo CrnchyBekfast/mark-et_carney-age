@@ -749,8 +749,111 @@ the graded behavior the roadmap flags as untested by the harness itself.
   was never a regression in the actual server code (`experiment.py 3` ran
   clean throughout, proving the code itself was fine the whole time).
 
-- [ ] Run A (stock buffers) — record whether backpressure appeared at all
+- [x] Run A (stock buffers) — complete, no backpressure observed (see raw
+      session log below) -- this is the predicted, reportable outcome
 - [ ] Run B (reduced buffers per §5) — record the predicted vs actual onset
+
+### Raw session log — Experiment 7, Run A (stock buffers)
+
+**Setup:** `EXCH_TRACE=exp7a_trace.jsonl python3 experiment.py 7 2>&1 | tee
+exp7a_console.log`, `tcpdump -i lo0 -n -s0 -w exp7a.pcap 'tcp port 5000'`
+running throughout. Server PID found via `sockstat -4 | grep 5000` (no
+`Started Exchange Server (PID ...)` line for this experiment, unlike
+Exps 1-6/8) -- PID 6121 owns the listening socket + all four server-side
+connection legs; PID 6119 is the harness's own driver process holding the
+client-side legs.
+
+**Connections** (sid=1/port 14729 is the usual readiness probe, RST'd in
+~60us -- not a tracked client):
+- sid=2, fd=7, port 20370 -- Market-Data client, **actively reading**
+- sid=3, fd=6, port 37573 -- Market-Data client, **the slow one, never reads**
+- sid=4, fd=8, port 21368 -- Buyer Trader
+- sid=5, fd=9, port 52518 -- Seller Trader
+
+**How slow vs normal was actually identified:** not from anything the
+server did differently (it can't tell -- both MD clients received
+identical `TRADE` broadcasts) but from four `netstat -an` samples taken
+across the run (~30%, ~50%, ~70%, ~end):
+
+| sample | sid=2 (port 20370) client-side Recv-Q | sid=3 (port 37573) client-side Recv-Q |
+|---|---|---|
+| ~30% | 17 | 29206 |
+| ~50% | 0 | 45390 |
+| ~70% | 0 | 65008 |
+| ~end | 36 | 82535 |
+
+sid=3's Recv-Q climbs steadily and ends within ~2.5KB of its entire
+cumulative feed (85003 B, below) -- it is never being drained by the
+client. sid=2 stays near zero the whole run -- it's reading promptly. All
+four samples: `ps -o pid,tid,wchan,state -H -p 6121` -> **`kqread`**,
+every single time, including while sid=3's backlog was near its maximum
+(**W1**).
+
+**Cumulative bytes queued per connection** (reconstructed by summing every
+`queue_out{n=...}` for that sid, since this experiment's clients never
+disconnect -- the server just gets `SIGTERM`'d at the end like every other
+experiment, so there is no per-connection `close` line to read a final
+tally from):
+
+| sid | role | cumulative queued (B) | final hwm (B) |
+|---|---|---|---|
+| 2 | MD, normal | 85003 | 17 |
+| 3 | MD, slow | 85003 | 17 |
+| 4 | Buyer | 189448 | 20 |
+| 5 | Seller | 179448 | 20 |
+
+Both MD clients: **85003 B total, matching B1's pre-flight 85000 B
+estimate almost exactly** -- direct confirmation the prediction arithmetic
+was right. `grep -c 'engine '` -> **10004** engine calls total, consistent
+with ~5002 completed trades × 2 (`BUY` rests, then `SELL` matches it -- two
+`engine.handle()` calls per completed trade), again matching the roadmap's
+5000-trade estimate.
+
+**T9 counters:** `send_would_block` count = **0** for the entire run. Both
+MD clients' server-side `wbuf` high-water mark never exceeded **17
+bytes** -- i.e. the server's userspace write buffer essentially never held
+anything beyond a single in-flight message, for either the slow or the
+normal client. Since `eagain=0` throughout, **queued == sent** for every
+connection -- nothing ever got stuck in `wbuf` waiting for a socket to
+become writable.
+
+**F3 (tcpdump `win 0` search) -- negative result, as predicted:**
+```sh
+tcpdump -r exp7a.pcap -n -ttt -S | grep -i 'win 0'
+```
+returned exactly two hits, both `Flags [R.]` RST packets from readiness
+probes (`win 0` there is just an RST artifact, not a flow-control
+advertisement) -- **no genuine zero-window advertisement or persist-timer
+probe occurred anywhere in this run.**
+
+**P1/P3 (pending bytes / cumulative queued vs sent):** effectively flat
+and near-identical for both MD clients at the server-side `wbuf` level
+(hwm=17 for both) -- the divergence between "slow" and "normal" shows up
+*only* in the client-side kernel `Recv-Q` (table above), never in
+anything the server's userspace buffering has to deal with.
+
+**P2 (engine latency):** 10004 calls, **mean 49.4us, min 3.4us**. Ten
+calls reached millisecond scale (5.08ms down to 1.6ms, strictly
+decreasing when sorted) -- consistent with one-time interpreter/OS
+warm-up cost on the earliest calls (first dict/deque growth for the order
+book, scheduler noise), not with sustained load: none of these coincide
+with any backpressure event, since none occurred in this run. The
+overwhelming majority of calls sit in the low tens of microseconds
+regardless of what sid=3's growing backlog was doing at the kernel level.
+
+**Run A finding, complete:** at stock socket-buffer settings
+(`sendspace=32768`/`recvspace=65536` with auto-tuning), **no backpressure
+reaches the server at all.** The specific mechanism: FreeBSD's
+`recvbuf_auto=1` lets the slow client's own kernel receive buffer grow
+dynamically well past its nominal default (confirmed climbing past 82KB)
+rather than ever closing its advertised window to zero within this
+run's ~85KB feed. With no zero window, the server's `send()` never
+returns `EWOULDBLOCK`, `wbuf` never accumulates, and the engine's latency
+distribution is indistinguishable from an unloaded system. This is
+exactly the outcome B1's pre-flight arithmetic predicted (85000 B feed vs
+~96-98KB effective stock capacity) -- Run B's job is to shrink that
+capacity below the feed size and watch the same mechanism actually engage.
+
 
 ---
 
@@ -770,13 +873,13 @@ Backpressure (Exp 7)
 
 | id | what | status | file(s) |
 |---|---|---|---|
-| P1 | pending bytes vs time, slow vs normal | ⬜ | |
-| P2 | engine latency flat during P1's ramp | ⬜ | |
-| P3 | cumulative queued vs sent, slow client | ⬜ | |
-| F3 | tcpdump win 0 + zero-window probes | ⬜ | |
-| T8 | netstat -an/-x snapshots, 3× × 2 clients | ⬜ | |
-| T9 | counters, run A vs run B | ⬜ | |
-| W1 | ps -o wchan during the flood: kqread | ⬜ | |
+| P1 | pending bytes vs time, slow vs normal | 🔶 Run A done | Run A: server-side wbuf hwm flat at 17B for both MD clients despite slow client's kernel Recv-Q climbing to 82535B -- divergence is kernel-side only, not server-side. Run B pending to show the server-side version of this. |
+| P2 | engine latency flat during P1's ramp | 🔶 Run A done | Run A: 10004 calls, mean 49.4us, min 3.4us, 10 ms-scale outliers all warm-up-consistent (decreasing, uncorrelated with load). Flat because there was no ramp to overlay against in Run A -- Run B needed for the real P2 figure (flat despite an actual ramp). |
+| P3 | cumulative queued vs sent, slow client | 🔶 Run A done | Run A: queued==sent exactly for sid=3 (slow MD client), eagain=0 -- no gap to plot since nothing ever backed up server-side. Run B pending to show an actual queued>sent gap. |
+| F3 | tcpdump win 0 + zero-window probes | 🔶 Run A done (negative) | Run A: no genuine win 0 found (2 hits, both RST artifacts) -- correctly predicted absence at stock buffers. Run B pending for the positive case. |
+| T8 | netstat -an/-x snapshots, 3× × 2 clients | 🔶 Run A done | Run A: 4 snapshots (slightly more than the minimum 3) showing sid=3's client-side Recv-Q climbing 29206->45390->65008->82535 while sid=2 stays ~0. Run B pending. |
+| T9 | counters, run A vs run B | 🔶 Run A done | Run A: send_would_block=0, wbuf_hwm=17B both MD clients, cumulative queued 85003B each (matches B1's 85000B prediction almost exactly). Run B pending for the contrast half of this artifact. |
+| W1 | ps -o wchan during the flood: kqread | 🔶 Run A done | Run A: kqread confirmed on all 4 samples, including near peak backlog. Run B pending (same check, expected same result even under real backpressure -- server never blocks in a socket write). |
 
 Architecture and lifecycle
 
