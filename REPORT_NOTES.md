@@ -63,7 +63,7 @@ new runs will repopulate this section and the artifact tracker.**
 - [x] Exp 4 (real server, redo) — clean, wchan=kqread (see raw log below)
 - [x] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast complete, wchan=sbwait (see raw log below)
 - [x] Exp 5 — T6 done, ready-vs-idle multiplexing confirmed (see raw log below)
-- [ ] Exp 6
+- [x] Exp 6 — T7 done, FIN vs RST matrix complete (see raw log below)
 - [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
       event loop, not just the offline engine test)
 
@@ -390,6 +390,174 @@ event-driven readiness means the cost of servicing this batch is O(ready)
 = O(3), not O(registered) = O(5) -- confirmed by the trace never once
 touching fd 6 or fd 8.
 
+### Raw session log — Experiment 6 (T7 complete)
+
+**Session A — `python3 experiment.py 6`:**
+```
+=== Experiment 6: FIN vs. RST: Orderly and Abrupt Connection Termination ===
+
+Started Exchange Server (PID 5457).
+     0.118ms listen           fd=3 host='127.0.0.1' port=5000 backlog=4096
+    75.437ms accept           sid=1 fd=5 peer='127.0.0.1:16693' nconn=1
+Exchange Server is listening.
+
+Part A: orderly connection termination (FIN).
+    75.496ms eof_rst          sid=1 fd=5 errno=54 ev_fflags=54
+Orderly client: connected from 127.0.0.1:63936
+    75.596ms close            sid=1 fd=5 why='RST' role='untyped' recvs=0 bytes_in=0 queued=0 sent=0 eagain=0 wbuf_hwm=0 orders_surviving=0
+The client will shut down its sending direction.
+Investigate the TCP traffic and connection state.
+    75.644ms destroy          sid=1 fd=5 nconn=0
+    75.726ms accept           sid=2 fd=5 peer='127.0.0.1:63936' nconn=1
+    75.759ms eof_fin          sid=2 fd=5 ev_eof=True
+    75.770ms close            sid=2 fd=5 why='FIN' role='untyped' recvs=0 bytes_in=0 queued=0 sent=0 eagain=0 wbuf_hwm=0 orders_surviving=0
+    75.818ms destroy          sid=2 fd=5 nconn=0
+
+Part B: abortive connection termination (RST).
+Abrupt client: connected from 127.0.0.1:50690
+The client will now close abortively.
+Investigate the TCP traffic and connection state.
+
+The Exchange Server will remain running for 15 seconds.
+ 10076.670ms accept           sid=3 fd=5 peer='127.0.0.1:50690' nconn=1
+ 10076.878ms eof_rst          sid=3 fd=5 errno=54 ev_fflags=54
+ 10076.958ms close            sid=3 fd=5 why='RST' role='untyped' recvs=0 bytes_in=0 queued=0 sent=0 eagain=0 wbuf_hwm=0 orders_surviving=0
+ 10077.010ms destroy          sid=3 fd=5 nconn=0
+
+Experiment finished.
+Stopping Exchange Server...
+ 25078.557ms signal           signo=15
+```
+
+sid=1/port 16693 is the same standard readiness probe seen at the top of
+every experiment so far (connect, then client-side RST within ~60us) --
+not a Part A/B artifact.
+
+**Session B — capture (`tcpdump -i lo0 -n -s0 -w exp6.pcap 'tcp port 5000'`)
+started slightly late (after Part A had already reached `CLOSED` locally --
+see the `netstat` sequence below), `netstat -an -p tcp | grep '\.5000 '`
+sampled repeatedly across the ~25s run, then capture stopped and read
+back:**
+```
+tcp4           0      0 127.0.0.1.63936        127.0.0.1.5000         CLOSED
+tcp4           0      0 127.0.0.1.5000         *.*                    LISTEN
+   (repeated -- 63936 entry drops out after this, LISTEN persists)
+   ... (11 more identical LISTEN-only samples while waiting for Part B) ...
+   (final sample: empty -- server had already received SIGTERM and exited
+   by the time this call ran, ~25s into the experiment)
+```
+Two things worth calling out precisely:
+- **Port 63936 (Part A, FIN) never showed `TIME_WAIT`** in any sample --
+  it went straight from a state we caught as `CLOSED` to gone. This is the
+  same fast-clearance pattern flagged in the Exp 2/3 redo notes and ties
+  directly into the still-open `net.inet.tcp.nolocaltimewait` question
+  below -- worth confirming with one more `sysctl` command before the
+  report states this as fact.
+- **Port 50690 (Part B, RST) never appeared in any of the ~13 samples at
+  all**, despite polling repeatedly right around when Part B fires
+  (t=10077ms). That absence *is* the finding: an RST tears down both
+  ends' state immediately, with no `CLOSE_WAIT`/`TIME_WAIT` window wide
+  enough to ever be caught by a polling `netstat`, unlike Part A's orderly
+  close which at least left a momentarily-observable `CLOSED` entry.
+
+**tcpdump readback (`tcpdump -r exp6.pcap -n -ttt -S`), annotated:**
+```
+127.0.0.1.10592 > 127.0.0.1.5000: Flags [S] ...
+127.0.0.1.5000  > 127.0.0.1.10592: Flags [R.] ...win 0        <- pre-bind
+                                                                  probe, refused
+                                                                  (no listener
+                                                                  yet -- no
+                                                                  accept trace
+                                                                  line exists
+                                                                  for this one;
+                                                                  OS-level
+                                                                  ECONNREFUSED,
+                                                                  not server code)
+
+127.0.0.1.16693 > 127.0.0.1.5000: Flags [S] ...
+127.0.0.1.5000  > 127.0.0.1.16693: Flags [S.] ...
+127.0.0.1.16693 > 127.0.0.1.5000: Flags [.] ...
+127.0.0.1.16693 > 127.0.0.1.5000: Flags [R.] ...              <- sid=1 readiness
+                                                                  probe (client-
+                                                                  initiated RST)
+
+127.0.0.1.63936 > 127.0.0.1.5000: Flags [S] ...
+127.0.0.1.5000  > 127.0.0.1.63936: Flags [S.] ...
+127.0.0.1.63936 > 127.0.0.1.5000: Flags [.] ...
+127.0.0.1.63936 > 127.0.0.1.5000: Flags [F.] ...               <- PART A: client
+                                                                   half-closes
+                                                                   (shutdown
+                                                                   SHUT_WR)
+127.0.0.1.5000  > 127.0.0.1.63936: Flags [.] ...                  server ACKs
+127.0.0.1.5000  > 127.0.0.1.63936: Flags [F.] ...               <- server sends
+                                                                   its OWN FIN
+                                                                   right back --
+                                                                   confirms the
+                                                                   server treats
+                                                                   EOF as FULL
+                                                                   teardown, not
+                                                                   a half-close
+                                                                   (it does not
+                                                                   keep trying to
+                                                                   write/drain
+                                                                   wbuf first)
+127.0.0.1.63936 > 127.0.0.1.5000: Flags [.] ...                   client ACKs --
+                                                                   full 4-way
+                                                                   close, client
+                                                                   sends the
+                                                                   final ACK
+
+  [10s gap]
+
+127.0.0.1.50690 > 127.0.0.1.5000: Flags [S] ...
+127.0.0.1.5000  > 127.0.0.1.50690: Flags [S.] ...
+127.0.0.1.50690 > 127.0.0.1.5000: Flags [.] ...
+127.0.0.1.50690 > 127.0.0.1.5000: Flags [R.] seq ... win 0     <- PART B: single
+                                                                   RST segment,
+                                                                   no FIN
+                                                                   exchange at
+                                                                   all, no ACK
+                                                                   needed --
+                                                                   connection is
+                                                                   just gone
+```
+
+**T7 artifact -- FIN vs RST comparison matrix:**
+
+| aspect | Part A (FIN, `shutdown(SHUT_WR)`) | Part B (RST, `SO_LINGER{1,0}`+`close()`) |
+|---|---|---|
+| wire flags | `[F.]` client, `[.]` ack, `[F.]` server, `[.]` ack -- full 4-way close | single `[R.]`, no FIN exchange, no ack needed |
+| `recv()` result | returns `b''` (clean EOF) | raises `ConnectionResetError` |
+| exception type | none -- EOF is not an exception path | `ConnectionResetError` |
+| errno | n/a | 54 (`ECONNRESET`) |
+| `ev.flags`/`ev.fflags` | `ev_eof=True`, no error in fflags | `ev_fflags=54` -- socket error already visible on `KQ_FILTER_READ`, *before* `recv()` is ever called |
+| server trace event | `eof_fin{ev_eof=True}` -> `close(why='FIN')` | `eof_rst{errno=54, ev_fflags=54}` -> `close(why='RST')` |
+| server state after | connection destroyed cleanly, `nconn` decremented, no other client affected | connection destroyed immediately via the same layered `except`, no other client affected (§4.4 holds) |
+| `TIME_WAIT`? | not observed in polling (see nuance below); no data was in flight either way | never observed -- RST bypasses the whole close handshake, so there is no wait state for a poller to ever catch |
+| in-flight data preserved? | n/a here -- both parts sent 0 bytes (`bytes_in=0`), pure lifecycle test; per the roadmap, RST *would* discard any queued/unacked data in both directions where FIN would not |
+
+**Nuance worth keeping for the report (per roadmap §8.6):** in Part A the
+client only closed its *write* side (`shutdown(SHUT_WR)`) and, per TCP
+semantics, could still legally receive for as long as the server kept the
+connection open. But the tcpdump readback shows the **server immediately
+sends its own FIN back** rather than staying half-open -- i.e. this
+server's EOF handling is "recv() returns empty -> tear the whole
+connection down," not half-close-aware (it does not attempt to drain
+`wbuf` and keep the read-closed/write-open socket alive). That is a
+documented architectural choice, not a bug, and directly explains why a
+full 4-way close is visible for Part A instead of a lingering half-open
+socket.
+
+**Precision-only-with-kqueue observation (the "genuinely sharp" one from
+the roadmap):** both the sid=1 readiness-probe RST *and* Part B's RST show
+the identical `ev_fflags=54` signature -- FreeBSD surfaces the socket
+error directly in `ev.fflags` on `KQ_FILTER_READ`, so the RST-vs-FIN
+distinction is available at the *readiness-notification* level, before a
+single byte is ever read. `eof_fin` never carries a errno/fflags value in
+this trace; `eof_rst` always does. That asymmetry, visible purely in the
+stderr trace with no `recv()` call needed to explain it, is exactly the
+kqueue-specific evidence T7 asks for.
+
 ### Known pitfalls (still applicable — read before re-running)
 
 - **Never pre-start the server before an `experiment.py N` invocation.**
@@ -453,7 +621,7 @@ Architecture and lifecycle
 | T2 | TCP state timeline, CLOSE_WAIT transient | ✅ | Exp 2 redo: CLOSE_WAIT 609us (3rd consistent sub-ms measurement across separate runs) — see raw session log |
 | T5 | Exp 4 correct vs naive control | ✅ | Exp 4 redo, both halves: real server wchan=kqread/0.001s vs naive wchan=sbwait/None-after-5.105s — see raw session log |
 | T6 | Exp 5 ready vs idle fds | ✅ | recv() called only on sid 2/4/6 (Clients 1/3/5) across the whole run; netstat confirms Recv-Q=0 both directions for Clients 2/4 -- see raw session log |
-| T7 | FIN vs RST matrix | ⬜ | |
+| T7 | FIN vs RST matrix | ✅ | Exp 6, both parts: FIN = 4-way close (server EOF triggers full teardown, not half-close), RST = single segment no handshake; `ev_fflags=54` present only on RST -- see raw session log + comparison table |
 | T10 | Exp 8 timeline + TRADE counts | ⬜ | |
 | T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ⬜ | |
 | T12 | errno reference table (35/32/54/60) | ⬜ | |
