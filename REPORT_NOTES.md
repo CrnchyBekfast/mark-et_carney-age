@@ -57,7 +57,7 @@ baseline was established) — all four experiments below are pending fresh
 runs. Previous findings for Exp 1–4 were valid but have been cleared here;
 new runs will repopulate this section and the artifact tracker.**
 
-- [ ] Exp 1
+- [x] Exp 1 (redo) — clean, T1 captured (see raw log below)
 - [ ] Exp 2
 - [ ] Exp 3
 - [ ] Exp 4 (real server)
@@ -66,6 +66,58 @@ new runs will repopulate this section and the artifact tracker.**
 - [ ] Exp 6
 - [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
       event loop, not just the offline engine test)
+
+### Raw session log — Experiment 1 (redo)
+
+**Session A:**
+```
+=== Experiment 1: Listening and Connected Sockets ===
+Started Exchange Server (PID 4898).
+     0.184ms listen           fd=3 host='127.0.0.1' port=5000 backlog=4096
+Exchange Server is listening.
+    76.643ms accept           sid=1 fd=5 peer='127.0.0.1:36613' nconn=1
+    76.682ms eof_rst          sid=1 fd=5 errno=54 ev_fflags=54
+    76.699ms close            sid=1 fd=5 why='RST' role='untyped' recvs=0 bytes_in=0 queued=0 sent=0 eagain=0 wbuf_hwm=0 orders_surviving=0
+    76.715ms destroy          sid=1 fd=5 nconn=0
+Experiment client: connected from 127.0.0.1:28907
+    76.861ms accept           sid=2 fd=5 peer='127.0.0.1:28907' nconn=1
+The client connection is now established and idle.
+[^C after telemetry captured in session B]
+Experiment finished. Stopping Exchange Server...
+ 76991.300ms eof_fin          sid=2 fd=5 ev_eof=True
+ 76991.477ms signal           signo=15
+```
+
+**Session B (live, while the client sat idle):**
+```
+$ sockstat -4 | grep 5000
+root python3.12 4898  3 tcp4  127.0.0.1:5000        *:*
+root python3.12 4898  5 tcp4  127.0.0.1:5000        127.0.0.1:28907
+root python3.12 4897  3 tcp4  127.0.0.1:28907       127.0.0.1:5000
+
+$ netstat -an -p tcp | grep 5000
+tcp4  0  0  127.0.0.1.5000    127.0.0.1.28907   ESTABLISHED
+tcp4  0  0  127.0.0.1.28907   127.0.0.1.5000    ESTABLISHED
+tcp4  0  0  127.0.0.1.5000    *.*               LISTEN
+```
+
+**T1 finding:** fd=3 (never assigned a `sid` -- it's the factory) is the
+*listening* socket: local `127.0.0.1:5000`, foreign `*:*`, state `LISTEN`.
+fd=5 (`sid=2`) is the *accepted/connected* socket: local `127.0.0.1:5000`,
+foreign `127.0.0.1:28907`, state `ESTABLISHED`. Both share the same local
+port -- it's the 4-tuple, not the port alone, that identifies a distinct
+connection. Consistent with the pre-redo run: readiness-probe RST first
+(`errno=54`/`ev_fflags=54`), then the real client accepted cleanly.
+
+**Minor timing curiosity (not a bug):** on this run, `eof_fin` (the server
+observing the harness's client sending its own FIN as part of Ctrl-C
+cleanup) fired only 177 microseconds before `signal signo=15` (the
+harness's SIGTERM to stop the server) -- so close/destroy for sid=2 never
+got to print before the process was terminated. Harmless (`sockstat`
+post-teardown confirmed the port was fully released), just a reminder that
+a SIGTERM landing mid-teardown can truncate the very last trace lines --
+don't read anything into a missing final `close`/`destroy` pair if a
+`signal` line follows immediately after.
 
 ### Known pitfalls (still applicable — read before re-running)
 
@@ -126,7 +178,7 @@ Architecture and lifecycle
 
 | id | what | status | file(s) |
 |---|---|---|---|
-| T1 | listening vs connected socket table | ⬜ | |
+| T1 | listening vs connected socket table | ✅ | Exp 1 redo, real VM run: fd=3 LISTEN `127.0.0.1:5000`/`*:*` vs fd=5 (sid=2) ESTABLISHED `127.0.0.1:5000`/`127.0.0.1:28907` — see raw session log |
 | T2 | TCP state timeline, CLOSE_WAIT transient | ⬜ | |
 | T5 | Exp 4 correct vs naive control | ⬜ | naive control code written + locally verified (`src/naive_server.py`, `src/tools/verify_naive_stall.py`); VM run pending |
 | T6 | Exp 5 ready vs idle fds | ⬜ | |
