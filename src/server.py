@@ -241,8 +241,20 @@ class Server:
             self._kq_set(c.fd, select.KQ_FILTER_READ,
                          select.KQ_EV_ADD | select.KQ_EV_ENABLE)
             # KQ_FILTER_WRITE is registered lazily, only when wbuf is non-empty.
+            # Ground truth for Experiment 7: what the KERNEL says this
+            # socket's buffers actually are, after the optional EXCH_SNDBUF
+            # setsockopt above.  netstat -x's R-HIWA/S-HIWA columns proved
+            # ambiguous (they disagreed with observed Recv-Q), so the
+            # per-socket getsockopt value is recorded instead of inferred.
+            try:
+                so_snd = cs.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+                so_rcv = cs.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
+            except OSError:
+                so_snd = so_rcv = -1
+
             tracelog.emit("accept", sid=c.sid, fd=c.fd,
-                          peer="%s:%d" % peer, nconn=len(self.conns))
+                          peer="%s:%d" % peer, nconn=len(self.conns),
+                          sndbuf=so_snd, rcvbuf=so_rcv)
 
     # -- read path --------------------------------------------------------
     def on_readable(self, c: Conn, ev) -> None:
