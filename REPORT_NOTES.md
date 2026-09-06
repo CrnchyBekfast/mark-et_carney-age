@@ -21,29 +21,75 @@ Every artifact ID below matches the manifest in `A2_Engineering_Roadmap.md`
       Receiver: off). **Note for report methodology section**, one line: not
       a code defect, purely a macOS dev-environment conflict; irrelevant to
       the FreeBSD grading VM.
-- [ ] `baseline.txt` captured **inside the FreeBSD VM** — B1. NOT valid from
-      macOS; the Exp 7 arithmetic in `src/tools/baseline.sh` needs the real
-      FreeBSD `sysctl` values.
+- [x] `baseline.txt` captured **inside the FreeBSD VM** — B1. Real
+      `sendspace=32768`/`recvspace=65536`, auto-tuning on both directions;
+      pre-flight arithmetic says stock buffers (98304 B) exceed the Exp 7
+      feed (85000 B) — Run B will reduce buffers to force backpressure into
+      the observation window.
 
 ## Day 1 — Phase 1 + 2 (offline, no sockets)
 
-- [ ] `framing.py` written and passing `T-FRAG-ALL` / `T-FRAG-RAND` /
-      `T-COALESCE` / `T-BOUNDARY` / `T-OVERFLOW` (`tests/test_all.py`)
-- [ ] `protocol.py` parser written (`parse_u32`, `parse_line`) passing
-      `T-VALID`
-- [ ] `engine.py` written passing `T-ENGINE`, including
+- [x] `framing.py` written and passing `T-FRAG-ALL` / `T-FRAG-RAND` /
+      `T-COALESCE` / `T-BOUNDARY` / `T-OVERFLOW` (`tests/test_all.py`) —
+      written verbatim to `PHASE_1_2_SPEC.md`'s mandated shape (eager single
+      compaction before `yield from lines`, per amendment 2)
+- [x] `protocol.py` parser written (`parse_u32`, `parse_line`) passing
+      `T-VALID` — `re.fullmatch` per amendment 1; the 6 syntax-only
+      `REASON_*` codes per amendment 5 (protocol.py never touches
+      `duplicate_username`/etc.)
+- [x] `engine.py` written passing `T-ENGINE`, including
       `test_engine_disconnect_then_match` — the §2.6 case the harness itself
       never exercises
-- [ ] `grep -ln 'import socket' src/*.py` → only `server.py`, `trader.py`,
-      `market_data.py`
+- [x] `grep -ln 'import socket' src/*.py` → only `server.py`, `trader.py`,
+      `market_data.py` (+ `naive_server.py`, added later, non-submission —
+      see Day 2-3) — confirmed
+- [x] `pytest` (`tests/test_all.py`): **29 passed**, clean, no test edits
+      needed
+
+Note: Phase 3 (`handle_readable_bytes()` wired to
+`framer.feed()` → `parse_line()` → `engine.handle()`) is done and deployed —
+this is the code currently running on the VM for all experiments below.
 
 ## Day 2–3 — Phase 3 + robustness (needs the VM)
 
-- [ ] Exps 1–5 clean in the VM
-- [ ] Naive blocking-server control built and run against Exp 4 (§8.4) —
-      T5
-- [ ] Exps 6, 8 clean; supplementary disconnect-then-match test passing
-      against the real event loop too
+**Restarting Exp 1–4 from scratch (decision made mid-project after a git
+baseline was established) — all four experiments below are pending fresh
+runs. Previous findings for Exp 1–4 were valid but have been cleared here;
+new runs will repopulate this section and the artifact tracker.**
+
+- [ ] Exp 1
+- [ ] Exp 2
+- [ ] Exp 3
+- [ ] Exp 4 (real server)
+- [ ] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast
+- [ ] Exp 5
+- [ ] Exp 6
+- [ ] Exp 8 (+ supplementary disconnect-then-match test against the real
+      event loop, not just the offline engine test)
+
+### Known pitfalls (still applicable — read before re-running)
+
+- **Never pre-start the server before an `experiment.py N` invocation.**
+  `experiment.py` manages the server's lifecycle itself (launches its own
+  `run-server` subprocess). Manually starting one first causes a port
+  collision (`OSError: [Errno 48] Address already in use`) on the harness's
+  own subprocess, producing a contaminated run with a stray traceback.
+- **FreeBSD's `pgrep -f` uses POSIX extended regex** — an escaped pipe like
+  `'run-server\|server.py'` is read literally and matches nothing. Use an
+  unescaped `'run-server|server.py'`, or just read the PID off `sockstat`'s
+  own output.
+- **`tcpdump` must be started before** the connection you want to capture —
+  starting it while a previous run's connection is still open/idle will mix
+  that leftover teardown into the new capture. Confirm any previous
+  `experiment.py` session is fully finished (Ctrl-C'd, port released via
+  `sockstat -4 | grep 5000` coming back empty) before starting a fresh
+  capture.
+- `EXCH_NAIVE=1 python3 experiment.py 4` runs the naive blocking-server
+  control (`src/naive_server.py`, gated in `server/run-server`) — throwaway,
+  non-submission code, written specifically for the T5 contrast. Verified
+  locally (Mac + this session's sandbox) before ever touching the VM:
+  Client 2 gets zero response within a 2s timeout when stalled behind
+  Client 1, confirming the predicted head-of-line block.
 
 ## Day 3 — Exp 7 (the centrepiece)
 
@@ -61,7 +107,7 @@ Fragmentation (§2.9 / §4.2 / Exp 3)
 | F1 | tcpdump: 4 segments 6/10/7/1 bytes | ⬜ | |
 | F2 | stderr trace: 4 recv, 3 frame_partial, 1 emitted | ⬜ | |
 | T3 | recv-call ledger (table) | ⬜ | |
-| T4 | offline framer pass counts (N-1 splits + 1000 random) | ⬜ | |
+| T4 | offline framer pass counts (N-1 splits + 1000 random) | ✅ | `tests/test_all.py::test_frag_all_split_positions` (N-1/N-1, N=48 for the 3-line LOGIN/BUY/SELL fixture) + `::test_frag_random_multiway_splits` (1000/1000, seed=0) — both green |
 | F4 | reverse direction: 3 SELLs + 1 sweeping BUY in one segment | ⬜ | |
 
 Backpressure (Exp 7)
@@ -80,15 +126,15 @@ Architecture and lifecycle
 
 | id | what | status | file(s) |
 |---|---|---|---|
-| T1 | listening vs connected socket table | ✅ (draft) | real data already captured — see session log: fd4=LISTEN no peer, fd6=ESTABLISHED 127.0.0.1:50387; redo cleanly in the VM with sockstat/procstat for the final version |
+| T1 | listening vs connected socket table | ⬜ | |
 | T2 | TCP state timeline, CLOSE_WAIT transient | ⬜ | |
-| T5 | Exp 4 correct vs naive control | ⬜ | |
+| T5 | Exp 4 correct vs naive control | ⬜ | naive control code written + locally verified (`src/naive_server.py`, `src/tools/verify_naive_stall.py`); VM run pending |
 | T6 | Exp 5 ready vs idle fds | ⬜ | |
-| T7 | FIN vs RST matrix | ⬜ | (already have one real RST sample: errno=54, ev_fflags=54 — reuse for the RST column, still need the FIN-side capture) |
+| T7 | FIN vs RST matrix | ⬜ | |
 | T10 | Exp 8 timeline + TRADE counts | ⬜ | |
 | T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ⬜ | |
 | T12 | errno reference table (35/32/54/60) | ⬜ | |
-| B1 | baseline.txt from the FreeBSD VM | ⬜ | |
+| B1 | baseline.txt from the FreeBSD VM | ✅ | captured on VM: `sendspace=32768`, `recvspace=65536` (auto-tuning on), capacity 98304 B vs Exp 7's 85000 B feed → pre-flight verdict says backpressure probably won't appear at stock settings; Run B (reduced buffers) planned to force it inside the window |
 
 ---
 
@@ -101,6 +147,12 @@ Architecture and lifecycle
   → decided: evict (roadmap §5) — confirm the eviction never actually
   triggers during a *normal* Exp 7 run (4 MiB is far above the ~85 KB feed);
   if it does trigger, something else is wrong.
+- Watch for Exp 2's `TIME_WAIT` behavior on the redo: previously it cleared
+  in <1s despite `msl=30000` implying a 60s hold. Leading hypothesis is
+  FreeBSD's `net.inet.tcp.nolocaltimewait` (defaults to `1`, skips full
+  `TIME_WAIT` for loopback-only connections) — check
+  `sysctl net.inet.tcp.nolocaltimewait` on the VM and confirm on this redo
+  before stating it as fact in the report.
 
 ## Things to remember to say in the viva
 
@@ -113,3 +165,7 @@ Architecture and lifecycle
 - The AirPlay Receiver incident, if asked "did you hit any surprises" —
   good evidence of methodical debugging (lsof → identified the real
   process on the connection → fixed the environment, not the code).
+- Git history: a baseline commit exists capturing Phase 1-3 + the naive
+  control, taken specifically so a bad step during robustness testing never
+  costs more than one experiment's redo — worth mentioning as evidence of
+  disciplined process if the viva asks about workflow/tooling.
