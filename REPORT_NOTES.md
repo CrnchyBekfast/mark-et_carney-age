@@ -559,6 +559,114 @@ this trace; `eof_rst` always does. That asymmetry, visible purely in the
 stderr trace with no `recv()` call needed to explain it, is exactly the
 kqueue-specific evidence T7 asks for.
 
+### Raw session log — Experiment 8 (T10 in progress) + supplementary T11 test (complete)
+
+**Part 1 -- harness `python3 experiment.py 8` (T10).** Full trace summarized
+(the actual run had ~150 repeated `recv`/`queue_out` lines for the
+buyer/seller trading loop -- omitted here except the boundary events):
+
+- sid=1/port 53095: standard readiness probe, not a tracked client.
+- sid=2/fd=5/port 48653: **Surviving Market-Data Client**, subscribes to
+  JNST (`hex` decodes to `SUBSCRIBE JNST\n`).
+- sid=3/fd=6/port 54619: **Buyer Trader** (`LOGIN experimenter_buyer`).
+- sid=4/fd=7/port 59156: **Seller Trader** (`LOGIN experimenter_seller`).
+- sid=5/fd=8/port 49686: **the Market-Data client that gets killed**, also
+  subscribes to JNST.
+
+Buyer/seller then trade JNST repeatedly (`BUY JNST 1 238` / `SELL JNST 1
+238` on a loop), each cycle producing `BOUGHT` to sid=3, `SOLD` to sid=4,
+and `TRADE` broadcast to both sid=2 and sid=5 (both MD subscribers).
+
+At **3882.042ms**, the harness's own narration reads "The Market-Data
+Client process will now disappear unexpectedly":
+```
+  3882.042ms eof_fin          sid=5 fd=8 ev_eof=True
+  3882.304ms close            sid=5 fd=8 why='FIN' role='untyped' recvs=1 bytes_in=15 queued=343 sent=343 eagain=0 wbuf_hwm=17 orders_surviving=0
+  3882.502ms destroy          sid=5 fd=8 nconn=3
+```
+`orders_surviving=0` confirms the killed connection is exactly the gap the
+roadmap names -- a Market-Data client owns no orders, so this run alone
+cannot exercise §2.6's order-survival clause (that's what the
+supplementary test below is for).
+
+**After the kill, trading continues** for another ~4.4s (up to
+8314.289ms) with the same `recv`/`queue_out` pattern for sid=3/sid=4/sid=2
+-- **sid=5 never appears again in the trace, at all, not even as a
+`notify_dropped` target.** That is itself informative, and different from
+what T11 shows below: the teardown path (`kill()`, per the roadmap's own
+pseudocode) actively removes a departing connection from `subs[instr]` at
+close time (`subs[i].discard(c.sid)`), so a later `TRADE` broadcast simply
+never iterates over sid=5 again -- there is no dangling notify attempt to
+log as dropped. This is the opposite of what happens to a Trader's resting
+*order* (see T11): orders are deliberately left untouched in the book, so
+a later match *does* still try to notify the departed owner and *does*
+produce a logged `notify_dropped`. Worth stating explicitly in the report:
+subscription cleanup is immediate and silent; order survival is
+deliberate and produces an observable drop on the next match.
+
+**Session B tcpdump (`exp8.pcap`), read back with
+`tcpdump -r exp8.pcap -n -ttt -S`:** confirms the accept/handshake and
+`SUBSCRIBE`/`LOGIN` pushes for all five connections, and the steady stream
+of `TRADE`/`BOUGHT`/`SOLD` pushes each trading cycle. The final teardown
+block (at the very end, after "Experiment finished") shows explicit FIN
+exchanges for ports 48653, 54619, and 59156 (the three survivors) but the
+capture is dense enough (hundreds of lines) that I have not yet pinned
+down port 49686's own FIN packet by eye with full confidence -- **one more
+command needed to close this out cleanly:**
+```sh
+tcpdump -r exp8.pcap -n -ttt -S | grep 49686
+```
+Expected: a `[F.]` (or possibly `[R.]`, though the server's own
+`eof_fin`/`ev_eof=True` trace strongly implies FIN, not RST) somewhere
+around the 3.88s mark, followed by no further packets from that port.
+Pending this confirmation before T10 is marked done in the tracker.
+
+**Part 2 -- supplementary test (T11), the gap the harness itself doesn't
+cover.** Manual test against a freshly-started server
+(`EXCH_TRACE=trace_t11.jsonl ./server/run-server 127.0.0.1 5000`), a
+Market-Data subscriber (`./client/run-market-data 127.0.0.1 5000 JNST`),
+and two `nc` clients (FreeBSD base `nc` needs `-N -w 2`, not GNU netcat's
+`-q1`, to send FIN after stdin EOF and not hang waiting to read).
+
+Trader A logs in, rests a BUY, disconnects cleanly (FIN via `nc`):
+```sh
+printf 'LOGIN trader_a\nBUY JNST 100 238\n' | nc -N -w 2 127.0.0.1 5000 > trader_a_out.log
+```
+Server confirms the resting order survives the disconnect:
+```
+162192.955ms close            sid=2 fd=7 why='FIN' role='untyped' recvs=1 bytes_in=32 queued=20 sent=20 eagain=0 wbuf_hwm=17 orders_surviving=1
+```
+`orders_surviving=1` -- exactly the T11 precondition the harness's own Exp
+8 (killing a Market-Data client) cannot produce.
+
+Trader B logs in, crosses the resting order:
+```sh
+printf 'LOGIN trader_b\nSELL JNST 60 238\n' | nc -N -w 2 127.0.0.1 5000 > trader_b_out.log
+```
+Server:
+```
+167024.123ms notify_dropped   target_sid=2 msg=b'BOUGHT JNST 60 238\n'
+167024.306ms close            sid=3 fd=7 why='FIN' role='untyped' recvs=1 bytes_in=32 queued=37 sent=37 eagain=0 wbuf_hwm=17 orders_surviving=0
+```
+
+All three client-side observations line up exactly with the prediction:
+```
+trader_a_out.log:  OK / ORDER_ACCEPTED 0                       (no BOUGHT -- connection was already gone)
+trader_b_out.log:  OK / ORDER_ACCEPTED 1 / SOLD JNST 60 238     (delivered normally, trader_b was connected throughout)
+md_out.log:        [sent] SUBSCRIBE JNST / OK / TRADE JNST 60 238   (broadcast reached the still-connected subscriber)
+```
+
+**T11 finding, complete:** a Trader's resting order genuinely outlives its
+TCP connection. Disconnecting via clean FIN leaves the order in the book
+(`orders_surviving=1` at close time, order object untouched -- per the
+roadmap, `Order.owner_sid` is an `int`, not a `Conn`). When a later order
+crosses it, the match executes in full: the trade completes, `SOLD`
+reaches the surviving counterparty, `TRADE` reaches the subscribed
+Market-Data client, and only the departed buyer's own `BOUGHT`
+notification is silently dropped (`notify_dropped{target_sid=2, ...}`)
+because `by_sid` no longer has an entry for that sid. This is precisely
+the graded behavior the roadmap flags as untested by the harness itself.
+
 ### Known pitfalls (still applicable — read before re-running)
 
 - **Never pre-start the server before an `experiment.py N` invocation.**
@@ -624,7 +732,7 @@ Architecture and lifecycle
 | T6 | Exp 5 ready vs idle fds | ✅ | recv() called only on sid 2/4/6 (Clients 1/3/5) across the whole run; netstat confirms Recv-Q=0 both directions for Clients 2/4 -- see raw session log |
 | T7 | FIN vs RST matrix | ✅ | Exp 6, both parts: FIN = 4-way close (server EOF triggers full teardown, not half-close), RST = single segment no handshake; `ev_fflags=54` present only on RST -- see raw session log + comparison table |
 | T10 | Exp 8 timeline + TRADE counts | ⬜ | |
-| T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ⬜ | |
+| T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ✅ | supplementary manual test: `close{orders_surviving=1}` for trader_a's disconnect, later `notify_dropped{target_sid=2, msg=BOUGHT...}` on the crossing trade; SOLD/TRADE delivered normally to survivors -- see raw session log |
 | T12 | errno reference table (35/32/54/60) | ⬜ | |
 | B1 | baseline.txt from the FreeBSD VM | ✅ | captured on VM: `sendspace=32768`, `recvspace=65536` (auto-tuning on), capacity 98304 B vs Exp 7's 85000 B feed → pre-flight verdict says backpressure probably won't appear at stock settings; Run B (reduced buffers) planned to force it inside the window |
 
