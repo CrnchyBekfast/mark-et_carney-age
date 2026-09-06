@@ -15,7 +15,7 @@ BLASTER (sender):
 VICTIM (receiver that never reads):
     python3 sb_probe.py --client <host> <port> [--rcvbuf N]
 
-Run the victim first, then the blaster.
+Start the BLASTER first (it listens), then the victim connects to it.
 
 The blaster reports the byte offset at which send() first returned EWOULDBLOCK
 -- that offset IS the total absorption capacity of the path (its own send
