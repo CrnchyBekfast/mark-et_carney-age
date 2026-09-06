@@ -720,6 +720,35 @@ the graded behavior the roadmap flags as untested by the harness itself.
 
 ## Day 3 — Exp 7 (the centrepiece)
 
+### Pre-Exp-7 prep (code + environment, not experiment findings)
+
+- **Added `engine{sid, n_msgs, engine_ns}` instrumentation to
+  `handle_readable_bytes()`** (`src/server.py`), timing the
+  `self.engine.handle(c.sid, payload)` call itself with
+  `time.monotonic_ns()` before/after, separate from the write path. This
+  did not exist before Exp 7 -- `queue_out{pending, hwm}` and
+  `eagain`/`wbuf_hwm` were already instrumented from Day 1, but nothing
+  measured engine latency directly, and **P2 (flat engine latency during
+  the backpressure ramp) is the single most important figure in the whole
+  experiment** -- it's the evidence that TCP backpressure structurally
+  cannot reach the matching engine. Verified firing correctly via a
+  smoke-test rerun of Exp 3 (`engine{sid=2, n_msgs=1, engine_ns=27042}`
+  appeared exactly where expected) before starting Exp 7 proper, so both
+  Run A and Run B have this instrumentation present from their first
+  message, keeping the two runs comparable.
+- **Fixed a `pytest` import-path issue**, unrelated to the above but
+  surfaced by the same verification pass: `tests/test_all.py` does
+  `from framing import Framer` with no `sys.path` manipulation anywhere,
+  and `pytest.ini` had no `pythonpath` setting either, so
+  `python3 -m pytest tests/test_all.py` failed at collection with
+  `ModuleNotFoundError: No module named 'framing'` when invoked from the
+  repo root. Added `pythonpath = src` to `pytest.ini` (supported natively
+  since pytest 7.0; confirmed both the Mac's pytest 8.4.2 and the VM's
+  9.1.1 handle it). Re-ran after the fix: **29 passed** on both machines.
+  Purely a test-runner plumbing fix -- no test content changed, and this
+  was never a regression in the actual server code (`experiment.py 3` ran
+  clean throughout, proving the code itself was fine the whole time).
+
 - [ ] Run A (stock buffers) — record whether backpressure appeared at all
 - [ ] Run B (reduced buffers per §5) — record the predicted vs actual onset
 
