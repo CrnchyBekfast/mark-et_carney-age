@@ -58,7 +58,7 @@ runs. Previous findings for Exp 1–4 were valid but have been cleared here;
 new runs will repopulate this section and the artifact tracker.**
 
 - [x] Exp 1 (redo) — clean, T1 captured (see raw log below)
-- [ ] Exp 2
+- [x] Exp 2 (redo) — clean, T2 captured (see raw log below)
 - [ ] Exp 3
 - [ ] Exp 4 (real server)
 - [ ] Exp 4 (naive control, `EXCH_NAIVE=1`) — T5 contrast
@@ -118,6 +118,60 @@ post-teardown confirmed the port was fully released), just a reminder that
 a SIGTERM landing mid-teardown can truncate the very last trace lines --
 don't read anything into a missing final `close`/`destroy` pair if a
 `signal` line follows immediately after.
+
+### Raw session log — Experiment 2 (redo)
+
+**Session A:**
+```
+=== Experiment 2: Observing TCP Connection States ===
+Started Exchange Server (PID 4956).
+    78.908ms accept  sid=1 fd=5 peer='127.0.0.1:29538' nconn=1
+    78.957ms eof_rst sid=1 fd=5 errno=54 ev_fflags=54
+Experiment client: connected from 127.0.0.1:25236
+    79.111ms accept  sid=2 fd=5 peer='127.0.0.1:25236' nconn=1
+Phase 1: idle. Phase 2: closing the client connection.
+The Exchange Server will remain running for 15 seconds.
+ 10081.099ms eof_fin  sid=2 fd=5 ev_eof=True
+ 10081.301ms close    sid=2 fd=5 why='FIN' ... orders_surviving=0
+ 10081.432ms destroy  sid=2 fd=5 nconn=0
+Experiment finished. Stopping Exchange Server...
+ 25085.212ms signal   signo=15
+```
+
+**tcpdump readback, isolated to this run's cycle (probe 29538, real client
+25236 -- matches session A's ports exactly):**
+```
++0.102908s  SYN 29538->5000 -> SYN/ACK -> ACK -> RST from 29538   <- readiness probe
++0.000125s  SYN 25236->5000 -> SYN/ACK -> ACK                      <- real client, ESTABLISHED
++10.001687s [25236->5000] FIN,ACK                                   <- client closes (active closer)
++0.000080s  [5000->25236] ACK                                       <- server ACKs FIN, CLOSE_WAIT begins
++0.000529s  [5000->25236] FIN,ACK                                   <- server's own close -- CLOSE_WAIT 609us total
++0.000016s  [25236->5000] ACK                                       <- client -> TIME_WAIT
+```
+
+**T2 finding:** third independent measurement of this server's
+CLOSE_WAIT-to-own-FIN latency, and it lands in the same sub-millisecond
+band as before -- 609us here, vs 656us and 507us in the pre-redo runs.
+Consistent and repeatable across three separate experiment invocations,
+strong enough now to state in the report as a property of the
+implementation, not a one-off. netstat's 0.5s polling never caught
+CLOSE_WAIT or even TIME_WAIT this time (continuous ESTABLISHED samples
+through ~12:29:35.30, then straight to LISTEN-only by ~12:29:35.82 --
+a ~0.51s gap with no TIME_WAIT sample at all), which is a stronger version
+of the same finding from the pre-redo Exp 2: the state genuinely exists
+(tcpdump proves it, at the packet level) but is too brief for a coarse
+netstat poll to land inside.
+
+**Capture-hygiene finding (new, feeds forward into Exp 3+):** this
+tcpdump also contains clearly leftover packets from the Exp 1 redo
+(ports 36613/28907, matching that run's ports exactly), separated from
+this run's cycle by multi-minute gaps -- tcpdump cannot retroactively
+capture packets sent before it started, so this points to a **stale
+tcpdump process from an earlier turn still running in the background on
+the VM**, continuously capturing port 5000 traffic across every
+experiment since. Before Exp 3's capture: run `pgrep tcpdump` (or
+`ps aux | grep tcpdump`) and `pkill tcpdump` to clear any leftover
+process, so future `.pcap` files contain only the run they're meant to.
 
 ### Known pitfalls (still applicable — read before re-running)
 
@@ -179,7 +233,7 @@ Architecture and lifecycle
 | id | what | status | file(s) |
 |---|---|---|---|
 | T1 | listening vs connected socket table | ✅ | Exp 1 redo, real VM run: fd=3 LISTEN `127.0.0.1:5000`/`*:*` vs fd=5 (sid=2) ESTABLISHED `127.0.0.1:5000`/`127.0.0.1:28907` — see raw session log |
-| T2 | TCP state timeline, CLOSE_WAIT transient | ⬜ | |
+| T2 | TCP state timeline, CLOSE_WAIT transient | ✅ | Exp 2 redo: CLOSE_WAIT 609us (3rd consistent sub-ms measurement across separate runs) — see raw session log |
 | T5 | Exp 4 correct vs naive control | ⬜ | naive control code written + locally verified (`src/naive_server.py`, `src/tools/verify_naive_stall.py`); VM run pending |
 | T6 | Exp 5 ready vs idle fds | ⬜ | |
 | T7 | FIN vs RST matrix | ⬜ | |
