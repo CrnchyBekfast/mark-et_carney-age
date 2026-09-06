@@ -48,6 +48,7 @@ import select
 import signal
 import socket
 import sys
+import time
 
 import framing
 import engine
@@ -295,7 +296,12 @@ class Server:
                     return
                 continue
 
-            for sid, msg in self.engine.handle(c.sid, payload):
+            t0 = time.monotonic_ns()
+            results = self.engine.handle(c.sid, payload)
+            engine_ns = time.monotonic_ns() - t0
+            tracelog.emit("engine", sid=c.sid, n_msgs=len(results), engine_ns=engine_ns)
+
+            for sid, msg in results:
                 self.queue_out(sid, msg)
 
             if c.dead:
