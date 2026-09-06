@@ -1,0 +1,4 @@
+#!/bin/sh
+# Trader Client launcher (COL334 A2 §6.0.2).
+# Invoked as: ./client/run-trader <host> <port> <username>
+exec python3 -u "$(dirname "$0")/../src/trader.py" "$@"

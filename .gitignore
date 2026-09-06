@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Trace / capture output (roadmap artifacts -- keep the analysis, not the raw
+# files, out of version control; copy the ones you cite into report.pdf)
+*.jsonl
+*.pcap
+baseline.txt
+*_terminal.log
+
+# Submission archives (rebuilt by src/tools/make_zip.sh, not tracked)
+A2_*.zip

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Market-Data Client launcher (COL334 A2 §6.0.2).
+# Invoked as: ./client/run-market-data <host> <port> <instrument>
+exec python3 -u "$(dirname "$0")/../src/market_data.py" "$@"
