@@ -751,7 +751,16 @@ the graded behavior the roadmap flags as untested by the harness itself.
 
 - [x] Run A (stock buffers) — complete, no backpressure observed (see raw
       session log below) -- this is the predicted, reportable outcome
-- [ ] Run B (reduced buffers per §5) — record the predicted vs actual onset
+- [x] Run B (reduced buffers per §5) — **null, and not for the predicted
+      reason**; see Day 4
+- [x] Run C — aborted, `kern.ipc.maxsockbuf` incident; see Day 4 (kept as a
+      methodology finding, not discarded)
+- [x] Run D (TCP-specific ceilings capped + `EXCH_SNDBUF=1024`) — still
+      null; this is the run that falsified the capacity model
+- [x] Run E (volume-forced, `exp7_load.py`) — **positive: real onset,
+      P1/P2/P3 evidence**
+- [x] Standalone isolation (`sb_probe.py`) — the buffer-enforcement finding,
+      with a Linux control
 
 ### Raw session log — Experiment 7, Run A (stock buffers)
 
@@ -843,16 +852,275 @@ regardless of what sid=3's growing backlog was doing at the kernel level.
 
 **Run A finding, complete:** at stock socket-buffer settings
 (`sendspace=32768`/`recvspace=65536` with auto-tuning), **no backpressure
-reaches the server at all.** The specific mechanism: FreeBSD's
-`recvbuf_auto=1` lets the slow client's own kernel receive buffer grow
-dynamically well past its nominal default (confirmed climbing past 82KB)
-rather than ever closing its advertised window to zero within this
-run's ~85KB feed. With no zero window, the server's `send()` never
-returns `EWOULDBLOCK`, `wbuf` never accumulates, and the engine's latency
-distribution is indistinguishable from an unloaded system. This is
-exactly the outcome B1's pre-flight arithmetic predicted (85000 B feed vs
-~96-98KB effective stock capacity) -- Run B's job is to shrink that
-capacity below the feed size and watch the same mechanism actually engage.
+reaches the server at all.** The server's `send()` never returns
+`EWOULDBLOCK`, `wbuf` never accumulates, and the engine's latency
+distribution is indistinguishable from an unloaded system. This is the
+outcome B1's pre-flight arithmetic predicted (85000 B feed vs ~96-98 KB
+effective stock capacity).
+
+> **CORRECTION (added Day 4 -- do not delete this note, it is the honest
+> version).** This section originally went on to assert a mechanism: that
+> `recvbuf_auto=1` let the slow client's receive buffer grow past its
+> nominal default rather than ever closing its window. **That claim was
+> subsequently refuted by direct measurement** and has been removed. Run E
+> shows the slow socket's `SO_RCVBUF` pinned at 81,720 for the entire
+> 11.35 MiB it absorbed -- autotuning never fired at all -- and
+> `sb_probe.py` shows a receiver with `SO_RCVBUF` *explicitly* pinned to
+> 8192 absorbing 67 MB, 8,192x its own buffer. The capacity model that
+> generated the correct *prediction* for Run A turns out not to be the
+> operative *mechanism* on this path. Run A alone cannot distinguish the
+> two explanations, because both predict the same null result; Runs B and
+> D could, and falsified the capacity model. See "Day 4" below.
+
+
+## Day 4 — Exp 7 continued: Runs B–E and the buffer-enforcement finding
+
+**In one paragraph.** Run B (reduce the buffers, per roadmap §5) produced
+results indistinguishable from Run A. Three further runs plus a standalone
+reproducer established why: **on this FreeBSD loopback path, a non-reading
+TCP receiver's socket-buffer limits are not enforced against the sender at
+all.** Backpressure cannot be produced by shrinking buffers, at any setting.
+It can be produced by volume. Run E did so, and yielded the real P1/P2/P3
+evidence.
+
+### Run B (reduced buffers) — null, and not for the predicted reason
+
+`recvspace=8192 sendspace=4096 recvbuf_auto=0 sendbuf_auto=0`. Pre-flight
+predicted capacity ~12 KB, onset at message ~723 of 5000.
+
+Observed: `send_would_block` = **0**. `wbuf_hwm` = 17 B for both MD clients.
+Cumulative queued 85,003 B each. No genuine `win 0`. **Every headline number
+identical to Run A**, despite an 8x buffer reduction. The slow client's
+`Recv-Q` climbed to ~85,000 while `netstat -x` reported `R-HIWA=8192` for
+that same socket.
+
+### Run C — aborted (keep this; it is a real methodology finding)
+
+Attempted with `kern.ipc.maxsockbuf=65536` added to the sysctl block. That
+knob is the **global** ceiling for every socket on the machine, Unix-domain
+sockets included. Lowering it starved `libcasper` (`sockstat` began failing
+with `Unable to contact Casper: No buffer space available`) and then sshd
+itself, which stopped completing handshakes
+(`kex_exchange_identification: Connection reset by peer`). Recovered from the
+VM's own console with `sysctl kern.ipc.maxsockbuf=8388608`; the run was
+discarded.
+
+**Report this in the methodology section.** `net.inet.tcp.*` ceilings are
+TCP-specific and safe to tune for an experiment; `kern.ipc.maxsockbuf` is
+global and is not. It is also a good illustration of why the baseline
+capture (B1) matters: recovery meant knowing the original value.
+
+### Run D — TCP ceilings capped properly, per-socket `SO_SNDBUF` — still null
+
+Only TCP-specific sysctls this time: `recvbuf_max=16384 sendbuf_max=16384
+recvspace=8192 sendspace=4096 recvbuf_auto=0 sendbuf_auto=0`, plus
+`EXCH_SNDBUF=1024` (a per-socket `setsockopt` at accept, which additionally
+clears `SB_AUTOSIZE` for that sockbuf -- something no sysctl does).
+Predicted capacity 1024 + 16384 = 17,408 B, i.e. onset at message ~1024 of
+5000.
+
+**The knobs demonstrably took effect.** The accept trace (new this run --
+see "Code and tooling" below) records `getsockopt` values per connection:
+every socket shows `SO_SNDBUF=1024`, `SO_RCVBUF=8192`. `netstat -x` confirms
+`S-HIWA=1024` on every server-side leg.
+
+And still: `send_would_block` = **0**, `wbuf_hwm` 17/17/20/20, no genuine
+`win 0`. The slow client's `Recv-Q` climbed monotonically across seven
+samples -- 12,223 → 23,409 → 40,188 → 52,921 → 66,487 → 79,492 → **83,266**
+-- against its own `R-HIWA` of 8192. A ~10x overshoot, measured on a freshly
+created connection whose provenance is unambiguous.
+
+**W1:** `wchan` = `kqread` on every sample.
+
+### The `netstat -x` column question, settled
+
+`netstat -x -p tcp | head -3` finally produced the header row (the first line
+is only a banner, which is why earlier attempts with `head -1` missed it):
+
+```
+Proto  Recv-Q Send-Q Local Address  Foreign Address  R-HIWA S-HIWA R-LOWA S-LOWA R-BCNT S-BCNT R-BMAX S-BMAX  rexmt persist keep 2msl delack rcvtime
+```
+
+- `Recv-Q`/`Send-Q` = `sb_cc`, the actual queued **data** bytes. **This is
+  the queue-depth number to quote.**
+- `R-BCNT`/`S-BCNT` = `sb_mbcnt`, mbuf **memory** accounting, inflated ~3x
+  because `TCP_NODELAY` gives every 17-byte TRADE its own segment and mbuf.
+- `R-BMAX` = `sb_mbmax` = **8 x `R-HIWA` exactly** -- verified on three
+  independent rows: 65,700x8 = 525,600 (the ssh session), 8,192x8 = 65,536,
+  4,096x8 = 32,768. The 8 is `kern.ipc.sockbuf_waste_factor`.
+
+Earlier working notes that read `R-BCNT` as occupancy were wrong. `Recv-Q`
+is the correct field.
+
+Also settled: `lo0` MTU is 16384, so MSS = 16,344, and the observed default
+`R-HIWA` of **81,720 = exactly 5 x MSS**. FreeBSD rounds the receive buffer
+to a whole number of maximum segments.
+
+### Run E — volume-forced; the run that produced the real evidence
+
+Design change: stop trying to shrink the target, and overwhelm it instead.
+Any absorption capacity has *some* ceiling; offered volume has none.
+`src/tools/exp7_load.py` pipelines matched pairs with batched writes and no
+per-trade drain (the harness's own ~850 B/s pacing is what made Runs A–D
+incapable of reaching any ceiling), draining the trader sockets continuously
+so they cannot become a second slow consumer, and never reading the
+subscriber.
+
+700,000 pairs, `EXCH_SNDBUF=2048 EXCH_WBUF_MAX=8388608`, **stock sysctls
+throughout -- no tuning at all**. Offered to the non-reading subscriber:
+700,000 x 17 = 11,900,000 B (trace records 11,900,003).
+
+`src/tools/exp7_report.py exp7e_trace.jsonl`:
+
+```
+event counts:  queue_out 3,500,003 · engine 1,400,003 · send_would_block 66
+               accept 3 · close 3 · write_enable 1 · write_disable 1
+buffers in force at accept (getsockopt): all three SO_SNDBUF=2048, SO_RCVBUF=81,720
+P1 onset:      first send_would_block at t = 93,102.525 ms, sid=3
+               (534,524 engine calls had already completed)
+```
+
+| sid | role | queued (B) | TRADEs | `wbuf_hwm` (B) | eagain |
+|---|---|---|---|---|---|
+| 1 | MD subscriber, **never reads** | 11,900,003 | 700,000 | 17 | 0 |
+| 2 | buyer | 28,151,893 | 10 | 23 | 0 |
+| 3 | seller | 26,737,003 | 0 | **1474** | **66** |
+
+All three closed with `why=FIN` and **`queued == sent` exactly**.
+
+**Which connection backed up, and why it was not the subscriber.** sid=1 is
+the non-reading subscriber; sid=2/3 are the traders. Backpressure landed on
+sid=3, the seller. `exp7_load.py` writes in batches of 500 order lines and
+drains the traders only after each full batch, so the server's replies
+(`ORDER_ACCEPTED` per order, then a burst of `SOLD`/`BOUGHT` as the SELLs
+sweep) can briefly outrun the generator's read loop. 66 events across
+700,000 pairs (~0.01%) is a rare, self-correcting stall. **It is genuine
+backpressure, correctly detected and correctly handled -- but it is a
+property of the load generator's write/drain interleaving, not of a
+deliberately slow consumer. Say so plainly in the report; do not dress it up
+as the textbook slow-subscriber case.**
+
+**P1 / P3 / T9, stated honestly.** `wbuf_hwm` 1474 B on sid=3 against 17 and
+23 on the others *is* the per-connection isolation result: the backlog is
+charged to the connection that caused it and to no one else. But
+`queued == sent` at close for all three, so the backlog was transient and
+fully drained -- **there is no standing `queued > sent` gap**. P3 therefore
+plots the difference series, not two cumulative lines four orders of
+magnitude apart (1.5 KB of backlog against 26.7 MB of traffic), which is why
+`plot.py` renders it as two stacked panels sharing one x-axis.
+
+**P2 — the strongest single result in the experiment.** `engine_ns` split at
+the onset:
+
+| window | n | p50 | p90 | p99 | p99.9 | max |
+|---|---|---|---|---|---|---|
+| pre-onset | 534,524 | 4.3 µs | 8.0 | 62.6 | 148.0 | 47,054 |
+| post-onset | 865,479 | **3.9 µs** | 6.6 | **55.0** | 121.0 | 64,416 |
+
+Ratios post/pre: **p50 x0.91, p99 x0.88** -- the engine ran marginally
+*faster* after backpressure engaged. Throughput **6,550/s → 7,364/s**.
+`write_enable` and `write_disable` each fired exactly once: the kqueue write
+filter was armed when the backlog appeared and correctly disarmed when it
+drained (the level-triggered spin trap the roadmap warns about did not
+occur). `wchan` = `kqread` throughout (W1).
+
+**The caveat to state rather than hide:** `engine_ns` brackets only
+`engine.handle()`, so by construction it *cannot* include write-path cost.
+It proves the matching engine is unaffected; it does not by itself prove the
+event loop never stalled in the write path. Throughput (loop iterations per
+second) and `wchan` are what cover that. The claim needs all three, and the
+report should say so -- it is a stronger argument for being explicit about
+what each instrument can and cannot show.
+
+### The buffer-enforcement finding (standalone, no exchange code)
+
+Run E's remaining oddity: sid=1 never called `recv()` and still absorbed all
+11,900,003 B with `eagain=0`, while its `SO_RCVBUF` read 81,720 at connect
+and 81,720 at the end -- autotuning never fired. `src/tools/sb_probe.py`
+isolates this with a blasting sender and a never-reading receiver and **no
+project code whatsoever**.
+
+| | lo0, default buffer | lo0, `SO_RCVBUF` pinned 8192 |
+|---|---|---|
+| `SO_RCVBUF` start → end | 81,720 → 122,580 | 8,192 → **8,192** |
+| bytes absorbed | 67,108,877 | 67,108,877 |
+| overshoot vs buffer | 821x | **8,192x** |
+| sustained stall | never | never |
+| `FIONREAD` before drain | 67,108,877 | 67,108,877 |
+| **actually drained** | 67,108,877 | 67,108,877 |
+
+Both runs stopped at the tool's own `--bytes` cap, **not at any kernel
+limit**. The receive buffer varied 15x between them and the absorbed byte
+count is identical to the byte. `FIONREAD` -- read from inside the receiving
+process, never through `netstat` -- agreed exactly with a drain-and-count, so
+the data genuinely was buffered. This is not a reporting artifact.
+
+The explicit pin *did* work for its stated purpose: `SO_RCVBUF` held at 8192
+(vs 81,720 → 122,580 unpinned), confirming `setsockopt` cleared
+`SB_AUTOSIZE`. It simply had no effect on what the path would accept.
+
+Transient `EWOULDBLOCK`s were 7 and 13 in the two runs, first at 3,052,758 B
+and 6,038,060 B respectively -- different counts at unrelated offsets, i.e.
+scheduling noise, not flow control. Had a buffer limit been participating,
+onset would be reproducible and proportional to buffer size.
+
+**Linux control, same tool:** capacity **17,081 B** against `SO_SNDBUF` 4,608
++ peer `SO_RCVBUF` 16,384, `FIONREAD` flat at 12,985. Textbook flow control
+-- and the behaviour FreeBSD is not showing on this path.
+
+**What does bound it.** `kern.ipc.nmbclusters` 254,663 (~497 MiB),
+`kern.ipc.maxmbufmem` 2,086,203,392 (~1.94 GiB), `kern.ipc.nmbufs`
+1,629,846. The 67 MiB run allocated **~208 MB** of network memory
+(`netstat -m`, "bytes allocated to network", total column) -- a **3.1x**
+amplification, matching the `sb_mbcnt`/`sb_cc` = 3.01 ratio measured
+independently in Run D. That is ~10% of the budget, with
+`requests for mbufs denied 0/0/0`. Nothing was ever going to push back at
+these volumes.
+
+Proving the mbuf pool is the *operative* bound would require driving it to
+exhaustion (~1.94 GiB ÷ 3.1 ≈ 640 MiB of payload). Given Run C already
+demonstrated what a starved network stack does to this VM, that test was
+deliberately not run: the arithmetic plus the zero-denial counters carry the
+claim, and the report should say the ceiling was computed rather than
+observed.
+
+### How to frame all of this in the report
+
+The pre-flight arithmetic (85,000 B feed vs 98,304 B stock capacity)
+predicted Run A's null outcome **correctly**, but Runs B and D show it
+predicted the right answer for the wrong reason: the capacity model is not
+the operative mechanism on this path. Run A alone could not distinguish the
+two explanations, since both predict a null. Runs B and D could, and
+falsified the capacity model.
+
+That is the honest account and it is a better story than "we shrank the
+buffers and it worked": a stated quantitative prediction, an experiment
+capable of refuting it, an actual refutation, a minimal standalone
+reproducer with a cross-platform control, and a corrected model -- plus a
+volume-based redesign that then produced the decoupling evidence the
+experiment was for.
+
+### Code and tooling added during Day 4
+
+- `src/server.py` — the `accept` trace now records
+  `getsockopt(SO_SNDBUF/SO_RCVBUF)` per connection, so the buffer actually in
+  force is **measured**, not inferred from `netstat`. This is what made Run D
+  interpretable.
+- `src/server.py` — corrected three stale artefacts a grader would see: a
+  module docstring still describing the file as a "Day-0 connection-layer
+  stub" that "does not parse the application protocol"; a `TODO` claiming
+  subscription/username cleanup was outstanding (`engine.on_disconnect` has
+  always done it); and the `close` trace's `role` field, which read
+  `Conn.role` -- never mutated -- so every close logged `role='untyped'`,
+  including logged-in traders. **Note: the `role='untyped'` values in the
+  T11 and Exp 8 raw logs above are from before this fix.**
+- `src/tools/exp7_load.py` — pipelined volume generator (Run E).
+- `src/tools/exp7_report.py` — trace reducer; splits every metric at the
+  onset, which is what makes the P2 pre/post comparison possible.
+- `src/tools/exp7_probe.py` — `FIONREAD` + drain-and-count diagnostic.
+- `src/tools/sb_probe.py` — standalone blaster/victim, no exchange code.
+- `src/tools/exp7_csv.py` + `src/tools/plot.py` — the P1/P2/P3 figure
+  pipeline (`plot.py` did not previously exist; roadmap §9 assumed it).
 
 
 ---
@@ -873,13 +1141,14 @@ Backpressure (Exp 7)
 
 | id | what | status | file(s) |
 |---|---|---|---|
-| P1 | pending bytes vs time, slow vs normal | 🔶 Run A done | Run A: server-side wbuf hwm flat at 17B for both MD clients despite slow client's kernel Recv-Q climbing to 82535B -- divergence is kernel-side only, not server-side. Run B pending to show the server-side version of this. |
-| P2 | engine latency flat during P1's ramp | 🔶 Run A done | Run A: 10004 calls, mean 49.4us, min 3.4us, 10 ms-scale outliers all warm-up-consistent (decreasing, uncorrelated with load). Flat because there was no ramp to overlay against in Run A -- Run B needed for the real P2 figure (flat despite an actual ramp). |
-| P3 | cumulative queued vs sent, slow client | 🔶 Run A done | Run A: queued==sent exactly for sid=3 (slow MD client), eagain=0 -- no gap to plot since nothing ever backed up server-side. Run B pending to show an actual queued>sent gap. |
-| F3 | tcpdump win 0 + zero-window probes | 🔶 Run A done (negative) | Run A: no genuine win 0 found (2 hits, both RST artifacts) -- correctly predicted absence at stock buffers. Run B pending for the positive case. |
-| T8 | netstat -an/-x snapshots, 3× × 2 clients | 🔶 Run A done | Run A: 4 snapshots (slightly more than the minimum 3) showing sid=3's client-side Recv-Q climbing 29206->45390->65008->82535 while sid=2 stays ~0. Run B pending. |
-| T9 | counters, run A vs run B | 🔶 Run A done | Run A: send_would_block=0, wbuf_hwm=17B both MD clients, cumulative queued 85003B each (matches B1's 85000B prediction almost exactly). Run B pending for the contrast half of this artifact. |
-| W1 | ps -o wchan during the flood: kqread | 🔶 Run A done | Run A: kqread confirmed on all 4 samples, including near peak backlog. Run B pending (same check, expected same result even under real backpressure -- server never blocks in a socket write). |
+| P1 | pending bytes vs time, per connection | ✅ data / ⬜ figure | Run E: `wbuf_hwm` 1474 B on sid=3 (backpressured) vs 17 B / 23 B on the other two — the backlog is charged to the connection that caused it. Run A adds the kernel-side contrast (slow client's `Recv-Q` → 82,535 B while the reading client stays ~0). Figure: `plot.py` → `P1_pending.png`. Note the "slow vs normal *subscriber*" framing is only available from Run A; Run E had a single subscriber. |
+| P2 | engine latency flat during P1's ramp | ✅ data / ⬜ figure | **Run E, the strongest result.** Split at the onset: pre 534,524 calls p50 4.3 µs / p99 62.6 µs; post 865,479 calls p50 3.9 µs / p99 55.0 µs → ratios ×0.91 / ×0.88, i.e. marginally *faster* under backpressure. Throughput 6,550/s → 7,364/s. Figure: `P2_engine.png`. Caveat to state: `engine_ns` brackets only `engine.handle()`, so throughput + `wchan` are what cover the write path. |
+| P3 | cumulative queued vs sent, backpressured sid | ✅ data / ⬜ figure | Run E sid=3: `queued == sent` at close, so the backlog is **transient, not standing** — 1474 B peak against 26.7 MB cumulative. Plotted as the difference series in a second panel (`P3_queued_sent.png`); two cumulative lines four orders of magnitude apart show nothing. |
+| F3 | tcpdump win 0 + zero-window probes | 🔶 **OUTSTANDING** | Run A: negative, correctly predicted (2 hits, both RST artifacts). Run D: negative. **Run E: the grep was never completed — the disk filled mid-command.** This is the one Exp 7 measurement still missing; re-run against `exp7e.pcap`. |
+| T8 | netstat -an/-x snapshots | ✅ | Run A: 4 samples (`Recv-Q` 29,206→45,390→65,008→82,535 vs ~0 for the reading client). Run D: 7 samples (12,223→83,266 against `R-HIWA`=8192). Run E: 5 samples. Column semantics settled — see "The `netstat -x` column question" in Day 4. |
+| T9 | counters, null run vs positive run | ✅ | **Axis reframed**: the original "Run A vs Run B" contrast is void, because buffer-shrinking changes nothing on this path (Runs B and D both null). The real contrast is harness-scale/null (A, B, D: `send_would_block`=0, hwm 17 B, 85,003 B offered) vs volume-forced/positive (E: `send_would_block`=66, hwm 1474 B, 11.9 MB offered to one subscriber). |
+| W1 | ps -o wchan during the flood: kqread | ✅ | `kqread` on every sample in Runs A, D and E, including at peak backlog. One Run E sample caught the loop in `Rs` (running, mid-iteration) rather than blocked — which is the same conclusion: never `sbwait`. |
+| K1 | **kernel buffer-enforcement finding** (not in the roadmap manifest; added because Exp 7 required explaining it) | ✅ | `sb_probe.py`, no exchange code: a never-reading receiver absorbed 67,108,877 B with `SO_RCVBUF` pinned at 8192 — **8,192× its own buffer** — verified by `FIONREAD` *and* a drain-and-count. Linux control on the same tool: 17,081 B, textbook flow control. Bound is global mbuf budget (`maxmbufmem` 1.94 GiB; the run used ~208 MB, 0 denials), computed rather than observed. |
 
 Architecture and lifecycle
 
@@ -926,6 +1195,27 @@ Architecture and lifecycle
   explanation -- and it's a legitimate thing to raise proactively in the
   viva as a limitation you identified yourself rather than one that would
   be caught.
+
+- **PARTIALLY RESOLVED — why buffer tuning could not produce backpressure.**
+  Established by measurement (Day 4): on this FreeBSD loopback path a
+  non-reading receiver's socket-buffer limits are not enforced against the
+  sender, whether the buffer was sized by sysctl or pinned explicitly with
+  `setsockopt`. Demonstrated with no project code by `sb_probe.py`
+  (8,192x overshoot), cross-checked against a Linux control that behaves
+  correctly, and `FIONREAD` + drain-and-count rule out a reporting artifact.
+  **What is established:** the effect is real, reproducible, and independent
+  of the exchange. **What is not:** the precise kernel mechanism. The
+  operative bound is almost certainly global mbuf availability
+  (`maxmbufmem` 1.94 GiB vs ~208 MB used, 0 denials), but that is an
+  arithmetic inference -- driving the pool to exhaustion was deliberately
+  not attempted after Run C showed what a starved network stack does to this
+  VM. **Report it at exactly this confidence level:** the observation and its
+  isolation are solid; the mechanism is stated as the most consistent
+  explanation, not as a demonstrated one.
+- **OUTSTANDING — F3.** The `win 0` search on `exp7e.pcap` was never
+  completed (disk filled mid-command). Until it is, the report cannot state
+  whether genuine zero-window advertisements accompanied Run E's 66
+  `send_would_block` events. Re-run it.
 
 ## Things to remember to say in the viva
 
