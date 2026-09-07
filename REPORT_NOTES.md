@@ -1234,6 +1234,121 @@ experiment was for.
   pipeline (`plot.py` did not previously exist; roadmap §9 assumed it).
 
 
+## Day 4 (cont.) — F4, T12, and two loose ends closed
+
+### Raw session log — F4 (reverse-direction coalescing)
+
+Three resting SELLs at one price, then one sweeping BUY, captured with
+`-s0` (payloads needed, unlike `exp7e.pcap`'s `-s 96`).
+
+Seller connects, rests three orders, disconnects:
+```
+accept  sid=1 fd=6 peer='127.0.0.1:40642' nconn=1 sndbuf=49032 rcvbuf=81720
+recv    sid=1 fd=6 n=67 rbuf_before=0 rbuf_after=0 lines_out=4        <- 4 messages, ONE recv
+engine  sid=1 n_msgs=1 engine_ns=22334      queue_out n=3    (OK)
+engine  sid=1 n_msgs=1 engine_ns=43000      queue_out n=17   (ORDER_ACCEPTED 0)
+engine  sid=1 n_msgs=1 engine_ns=17417      queue_out n=17   (ORDER_ACCEPTED 1)
+engine  sid=1 n_msgs=1 engine_ns=6584       queue_out n=17   (ORDER_ACCEPTED 2)
+close   sid=1 why='FIN' role='trader' queued=54 sent=54 wbuf_hwm=17 orders_surviving=3
+```
+
+Buyer connects and sweeps all three:
+```
+accept  sid=2 fd=6 peer='127.0.0.1:47384' nconn=1 sndbuf=49032 rcvbuf=81720
+recv    sid=2 fd=6 n=31 lines_out=2                                  <- 2 messages, ONE recv
+engine  sid=2 n_msgs=1 engine_ns=18250      queue_out n=17  pending=17  (ORDER_ACCEPTED 3)
+engine  sid=2 n_msgs=7 engine_ns=49583      <- ONE engine call, SEVEN messages
+        queue_out sid=2 n=19 pending=19     (BOUGHT JNST 10 500)
+        notify_dropped target_sid=1 msg=b'SOLD JNST 10 500\n'
+        queue_out sid=2 n=19 pending=19     (BOUGHT)
+        notify_dropped target_sid=1 msg=b'SOLD JNST 10 500\n'
+        queue_out sid=2 n=19 pending=19     (BOUGHT)
+        notify_dropped target_sid=1 msg=b'SOLD JNST 10 500\n'
+close   sid=2 why='FIN' role='trader' queued=77 sent=77 wbuf_hwm=19 orders_surviving=0
+```
+
+Client-side, exactly as the protocol requires:
+```
+seller: OK / ORDER_ACCEPTED 0 / ORDER_ACCEPTED 1 / ORDER_ACCEPTED 2
+buyer:  OK / ORDER_ACCEPTED 3 / BOUGHT JNST 10 500 x3
+```
+
+**F4's prediction is refuted, and that is the reportable result.** The
+roadmap expected `flush()` to coalesce one loop iteration's output into a
+single `send()`, putting `ORDER_ACCEPTED` + 3x`BOUGHT` in one segment. The
+`tcpdump -A` readback shows **three separate segments of `length 19`**, each
+carrying one `BOUGHT`. The trace explains why in one column: `pending` reads
+17, 19, 19, 19 — never accumulating. `queue_out()` calls `self.flush(c)`
+immediately after appending each message, so under normal conditions every
+message is written by its own `send()`, and `TCP_NODELAY` prevents Nagle from
+re-merging them.
+
+**What F4 does prove, in the other direction.** `recv n=67 lines_out=4`: the
+seller's `LOGIN` and all three `SELL` lines arrived in a *single* segment and
+were separated only by the framer. Same again for the buyer at
+`n=31 lines_out=2`. That is precisely the "application message boundaries are
+not TCP segment boundaries" claim F4 exists to support — demonstrated
+inbound, and the exact complement of Exp 3, where **one** message arrived as
+**four** segments. Together, F1/T3 and F4 bracket the byte-stream property
+from both sides.
+
+**Outbound coalescing does happen — but only under backpressure.** Run E's
+`wbuf_hwm=1474` on sid=3 is exactly that: once `send()` returned
+`EWOULDBLOCK`, subsequent messages accumulated in `wbuf` and were later
+written in one large `send()`. So the honest statement is that this server
+coalesces outbound *only* when the socket is not writable, which is the
+correct behaviour — opportunistic per-message flush minimises latency when
+the peer is keeping up, and batches automatically when it is not.
+
+**Three pieces of free corroborating evidence in this run:**
+
+1. `role='trader'` in both `close` lines — the Day 4 fix working. Every
+   earlier log in this file shows `role='untyped'` here.
+2. `notify_dropped target_sid=1` x3 — the departed seller's `SOLD`
+   notifications dropped while the buyer's `BOUGHT` and the trade itself
+   proceeded. An **independent reproduction of T11 / §2.6**, obtained without
+   trying.
+3. `engine sid=2 n_msgs=7` — one `engine.handle()` call returning seven
+   messages, dispatched by the server. Direct evidence for the design claim
+   that the engine returns `(sid, message)` pairs and never touches a socket.
+
+Also: `sndbuf=49032 = 3 x 16344` and `rcvbuf=81720 = 5 x 16344` in the accept
+lines, independently confirming the MSS-rounding finding from Day 4 on a
+completely separate run.
+
+### T12: errno reference
+
+| errno | name | status | evidence / why not |
+|---|---|---|---|
+| **35** | `EAGAIN`/`EWOULDBLOCK` | ✅ observed | Run E: 66 `send_would_block` events on sid=3, `eagain=66` in its `close` line. Raised by `c.sock.send()` as `BlockingIOError`, caught in `flush()`, counted, and answered by arming `KQ_FILTER_WRITE`. |
+| **54** | `ECONNRESET` | ✅ observed, abundantly | Every experiment: the harness's `SO_LINGER{1,0}` readiness probe produces `eof_rst errno=54 ev_fflags=54` before Experiment 1 even begins. Exp 6 Part B is the deliberate case. |
+| **32** | `EPIPE` | ❌ not observed — **structurally, with a reason** | Requires writing to a peer that is already gone. This server learns of a peer's departure through `kevent()` readiness (`eof_fin`/`eof_rst`) and tears the connection down *before* attempting another write — Exp 8's trace shows exactly this: the killed client's FIN was detected and no further `send()` was attempted. Reaching `EPIPE` needs a write already in flight at the instant of death, a timing race this workload does not hit. Python also sets `SIGPIPE` to `SIG_IGN` at startup, so it would surface as `BrokenPipeError`, which `flush()` already catches (`kill(c, 'peer_gone')`). |
+| **60** | `ETIMEDOUT` | ❌ not observed — **impossible on this testbed** | Requires retransmission timeout: a peer that stops responding without sending RST. Every connection in every experiment is over `lo0`, where there is no packet loss and no path to lose a peer silently. Producing it would need a real network with a partition or a firewall drop, which is outside the assignment's single-host setup. |
+
+Reporting *why* an errno cannot arise here is stronger than a blank row: two
+are demonstrated from real traces, and two are absent for reasons that follow
+from the architecture and the testbed rather than from missing coverage.
+
+### Two loose ends closed
+
+**The "+3 bytes" is resolved.** Exp 7 Run A recorded 85,003 B cumulative to
+each MD client against a predicted 85,000, and the note said "almost
+exactly". F4's trace identifies the remainder precisely: `queue_out n=3` is
+`OK\n`, the reply to `SUBSCRIBE`. So 5000 x 17 + 3 = 85,003 exactly, and Run
+E's 700,000 x 17 + 3 = 11,900,003 for sid=1 follows the same pattern. No
+approximation remains anywhere in the byte accounting.
+
+**P1 needed a reduction fix.** The first `plot.py` run produced a figure
+oscillating between 16 and 23 bytes with the 1,474 B peak nowhere visible.
+Cause: `exp7_csv.py` was sampling the *last* `pending` value per time bucket,
+but `pending` is traced after the append and before the flush, so in the
+unblocked case it is simply the message size. The backpressure spike was
+being averaged away. Fixed to carry a per-bucket **maximum**
+(`pending_max`), which is the correct semantic for a high-water figure. Worth
+one line in the report's methodology: the instrumentation was correct, the
+*reduction* was not, and the figure is what exposed it.
+
+
 ---
 
 ## Artifact tracker
@@ -1246,7 +1361,7 @@ Fragmentation (§2.9 / §4.2 / Exp 3)
 | F2 | stderr trace: 4 recv, 3 frame_partial, 1 emitted | ✅ | `frame_partial`/`frame_complete` don't fire post-Phase-3-rewiring (by design); `recv`'s own `rbuf_after` (0→6→16→23→0) + single `queue_out` after the 4th recv is the equivalent, cleaner evidence |
 | T3 | recv-call ledger (table) | ✅ | Exp 3 redo: n=6,10,7,1, rbuf_after=6,16,23,0, lines_out=0,0,0,1 — exact match to predicted ledger |
 | T4 | offline framer pass counts (N-1 splits + 1000 random) | ✅ | `tests/test_all.py::test_frag_all_split_positions` (N-1/N-1, N=48 for the 3-line LOGIN/BUY/SELL fixture) + `::test_frag_random_multiway_splits` (1000/1000, seed=0) — both green |
-| F4 | reverse direction: 3 SELLs + 1 sweeping BUY in one segment | ⬜ | |
+| F4 | reverse direction: coalescing | ✅ **prediction refuted, and the refutation is the finding** | The roadmap predicted `ORDER_ACCEPTED` + 3x`BOUGHT` in **one** outbound segment. **They arrive as three separate 19-byte segments.** Cause: `queue_out()` calls `flush()` per message, so each message is written by its own `send()`, and `TCP_NODELAY` means Nagle does not re-merge them. What *is* demonstrated is **inbound** coalescing — `recv n=67 lines_out=4` (LOGIN + 3 SELLs in a single segment) and `recv n=31 lines_out=2` — which is the same "app boundaries ≠ segment boundaries" point in the receive direction, and the exact complement of Exp 3's fragmentation. Outbound coalescing *does* occur, but only under backpressure (Run E, `wbuf_hwm`=1474). See the F4 session log. |
 
 Backpressure (Exp 7)
 
@@ -1272,7 +1387,7 @@ Architecture and lifecycle
 | T7 | FIN vs RST matrix | ✅ | Exp 6, both parts: FIN = 4-way close (server EOF triggers full teardown, not half-close), RST = single segment no handshake; `ev_fflags=54` present only on RST -- see raw session log + comparison table |
 | T10 | Exp 8 timeline + TRADE counts | ✅ | SIGKILL'd MD client (sid=5): `eof_fin` at 3882.042ms, `orders_surviving=0`, confirmed clean 4-way FIN close on the wire (`tcpdump | grep 49686`); buyer/seller/surviving MD client unaffected -- see raw session log |
 | T11 | §2.6 order-survival: close→orders_surviving>0→later notify_dropped | ✅ | supplementary manual test: `close{orders_surviving=1}` for trader_a's disconnect, later `notify_dropped{target_sid=2, msg=BOUGHT...}` on the crossing trade; SOLD/TRADE delivered normally to survivors -- see raw session log |
-| T12 | errno reference table (35/32/54/60) | ⬜ | |
+| T12 | errno reference table (35/32/54/60) | ✅ | Two observed with evidence, two **structurally absent on this workload with a stated reason** — see "T12: errno reference" below. Reporting why an errno cannot occur here is stronger than leaving the row blank. |
 | B1 | baseline.txt from the FreeBSD VM | ✅ | captured on VM: `sendspace=32768`, `recvspace=65536` (auto-tuning on), capacity 98304 B vs Exp 7's 85000 B feed → pre-flight verdict says backpressure probably won't appear at stock settings; Run B (reduced buffers) planned to force it inside the window |
 
 ---

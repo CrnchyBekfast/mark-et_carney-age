@@ -100,7 +100,7 @@ def read_conn(prefix):
         for r in csv.DictReader(fh):
             d = series[int(r["sid"])]
             d["t"].append(float(r["t_ms"]) / 1000.0)
-            d["pending"].append(int(r["pending"]))
+            d["pending"].append(int(r.get("pending_max", r.get("pending", 0))))
             d["q"].append(int(r["cum_queued"]))
             d["s"].append(int(r["cum_sent"]))
     return series

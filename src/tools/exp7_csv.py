@@ -10,7 +10,7 @@ is far too large to move off the VM or feed to matplotlib directly, and the
 figures only need a few thousand points. This streams the trace once, in
 constant memory, and writes three small CSVs:
 
-    <prefix>_conn.csv     t_ms, sid, pending, cum_queued, cum_sent
+    <prefix>_conn.csv     t_ms, sid, pending_max, pending_last, cum_queued, cum_sent
     <prefix>_engine.csv   t_ms, n, p50_ns, p90_ns, p99_ns, max_ns
     <prefix>_events.csv   t_ms, ev, sid
 
@@ -61,13 +61,14 @@ def main():
     conn_f = open(prefix + "_conn.csv", "w")
     eng_f = open(prefix + "_engine.csv", "w")
     evt_f = open(prefix + "_events.csv", "w")
-    conn_f.write("t_ms,sid,pending,cum_queued,cum_sent\n")
+    conn_f.write("t_ms,sid,pending_max,pending_last,cum_queued,cum_sent\n")
     eng_f.write("t_ms,n,p50_ns,p90_ns,p99_ns,max_ns\n")
     evt_f.write("t_ms,ev,sid\n")
 
     # per-sid running state, carried across buckets
     cum_queued = {}
-    pending = {}
+    pending = {}        # instantaneous, for the exact cum_sent derivation
+    pend_max = {}       # max within the current bucket, for the P1 series
     eng_bucket = []
     cur_bucket = None
     n_lines = 0
@@ -80,7 +81,8 @@ def main():
         for sid in sorted(cum_queued):
             q = cum_queued[sid]
             p = pending.get(sid, 0)
-            conn_f.write("%.1f,%s,%d,%d,%d\n" % (t, sid, p, q, q - p))
+            pm = pend_max.get(sid, p)
+            conn_f.write("%.1f,%s,%d,%d,%d,%d\n" % (t, sid, pm, p, q, q - p))
         if eng_bucket:
             eng_bucket.sort()
             eng_f.write("%.1f,%d,%d,%d,%d,%d\n"
@@ -108,6 +110,11 @@ def main():
             elif b != cur_bucket:
                 flush(cur_bucket)
                 eng_bucket = []
+                # pending is sampled after append and before flush, so in the
+                # unblocked case it is just the message size. Carrying a
+                # per-bucket MAX is what makes the backpressure spike visible
+                # in P1; a last-value sample averages it away entirely.
+                pend_max = {}
                 cur_bucket = b
 
             ev = r.get("ev")
@@ -115,7 +122,10 @@ def main():
 
             if ev == "queue_out":
                 cum_queued[sid] = cum_queued.get(sid, 0) + (r.get("n") or 0)
-                pending[sid] = r.get("pending") or 0
+                pv = r.get("pending") or 0
+                pending[sid] = pv
+                if pv > pend_max.get(sid, 0):
+                    pend_max[sid] = pv
             elif ev == "engine":
                 ns = r.get("engine_ns")
                 if ns is not None:
