@@ -1148,6 +1148,53 @@ instrument** — alongside `netstat` `Recv-Q`, `getsockopt(SO_RCVBUF)`, and
 Also confirmed here: `mss 16344` in the handshake, which is what makes the
 default `R-HIWA` of 81,720 exactly 5 x MSS.
 
+### Methodology note: live instruments vs frozen artifacts
+
+Worth stating explicitly, because "when did you take that measurement?" is a
+fair viva question and the answer differs by instrument.
+
+| instrument | kind | must be contemporaneous with the run? |
+|---|---|---|
+| `netstat -an` / `netstat -x`, `sockstat`, `ps -o wchan` | live kernel state | **yes** |
+| `getsockopt(SO_RCVBUF)`, `FIONREAD` | live, from inside the process | **yes** |
+| `.pcap`, `$EXCH_TRACE` JSONL, `tee`d console logs | frozen artifacts | **no** |
+
+All live readings were taken during their runs: T8 is 4 samples in Run A,
+7 in Run D, 5 in Run E; `wchan` alongside each; the `getsockopt`/`FIONREAD`
+values are printed by `exp7_load.py` / `exp7_probe.py` / `sb_probe.py` while
+the run is in progress.
+
+The F3 analysis and every number from `exp7_report.py` come from frozen
+artifacts, and were produced in a later session. **This does not weaken
+them.** `tcpdump -r` reads a file: the `win` values, packet directions and
+SYN options were serialised at capture time and re-reading is a pure
+function of the file. It is in fact a point in their favour -- the analysis
+is reproducible by anyone holding the same `.pcap`.
+
+Two conditions that *would* have invalidated the post-hoc read, both checked:
+
+- **Capture completeness.** Run E's capture stopped with
+  `5252898 packets captured / 5252898 packets received by filter /
+  0 packets dropped by kernel`. Captured equals received-by-filter with zero
+  kernel drops, so nothing was missed. (Contrast the aborted Run C, where a
+  `.pcap` was read *while tcpdump still had it open* and produced
+  `invalid packet capture length ... bigger than snaplen` -- always stop the
+  capture before reading it.)
+- **File integrity.** The F3 pass walked the whole file with no truncation
+  error and produced coherent head *and* tail output.
+
+**Honest limitation:** being post-hoc, the wire analysis cannot be
+cross-checked against live kernel state at the same instants. It does not
+need to be -- the live `netstat` snapshots taken during Run E already agree
+with it (subscriber `Recv-Q` climbing monotonically, server-side `Send-Q`
+at 0), and that cross-check *was* contemporaneous.
+
+**Snaplen caveat.** `exp7e.pcap` was captured with `-s 96`: headers only
+(4 B loopback + 20 B IP + up to 60 B TCP with options = 84 <= 96), which is
+why the SYN's `mss 16344, wscale 8` were readable. Payloads are truncated, so
+message *contents* cannot be decoded from that file. F3 does not need them.
+F4's capture uses `-s0` precisely because it does.
+
 ### How to frame all of this in the report
 
 The pre-flight arithmetic (85,000 B feed vs 98,304 B stock capacity)
