@@ -1084,6 +1084,70 @@ deliberately not run: the arithmetic plus the zero-denial counters carry the
 claim, and the report should say the ceiling was computed rather than
 observed.
 
+### F3, and what the wire actually shows
+
+The `win 0` search on `exp7e.pcap` returns **1,630,569** non-RST hits, which
+looks at first like overwhelming evidence of receiver flow control. It is the
+opposite. Broken down by direction:
+
+| count | direction | interpretation |
+|---|---|---|
+| 930,144 | `5000 > 35156` (server → buyer) | server's own receive window |
+| 700,425 | `5000 > 54139` (server → seller) | server's own receive window |
+| **0** | **`12398 > 5000`** (subscriber → server) | **never once** |
+
+(930,144 + 700,425 = 1,630,569 exactly — there are no other sources.)
+
+**The `win` field is always the sender's own receive window**, so every one of
+these is the *server* advertising that *it* has no room for more inbound
+data. They are `[P.]` packets carrying replies (`length 18`, `length 20`), so
+the server is pushing output while simultaneously telling the traders to stop
+sending orders.
+
+**Bonus finding, worth a paragraph in the report.** This is genuine,
+textbook receiver flow control — just on the inbound path rather than the one
+Experiment 7 asks about. `exp7_load.py` writes 500-line batches, the server's
+receive buffer for the trader sockets fills faster than the event loop drains
+it, and TCP correctly closes the window to throttle the generator. It is the
+mirror image of the outbound backpressure story, and it is the reason the
+generator settles to a stable ~3,600 pairs/s instead of running away.
+
+**F3 proper — the non-reading subscriber — is a negative, and a much
+sharper one than "no zero window."** Its full window history:
+
+```
+SYN   12398 > 5000: Flags [S], win 65535, options [mss 16344, wscale 8, sackOK, ...]
+SYN.  5000 > 12398: Flags [S.], win 65535, options [mss 16344, wscale 8, sackOK, ...]
+first 12398 > 5000: Flags [.],  ack ..., win 320      <- t = 18:24:54
+last  12398 > 5000: Flags [.],  ack ..., win 320      <- t = 18:28:13, 11,900,003 B later
+FIN   12398 > 5000: Flags [F.], ack ..., win 320
+```
+
+With `wscale 8`, `win 320` = **320 x 256 = 81,920 bytes**, which matches the
+measured `R-HIWA` of 81,720 to within one scale unit (81,720/256 = 319.2,
+rounded up to 320).
+
+**The receiver did not merely fail to send a zero window — it advertised a
+constant, wide-open 81,920-byte window for the entire run.** A receiver whose
+buffer is filling should shrink progressively (81,920 → 60,000 → 30,000 → 0).
+This one held the same value from its first ACK to its last, across 11.9 MB
+it never read. The sender was never asked to slow down, which is precisely
+why `send()` never returned `EWOULDBLOCK` and why `wbuf` never accumulated
+for sid=1.
+
+**Why this is the strongest form of the K1 evidence.** The control is inside
+the same capture, on the same kernel, the same loopback interface, the same
+run: the server's TCP shrank its window to zero 1.6 million times when *its*
+receive buffer filled. So this stack unambiguously does perform receiver flow
+control. The failure is specific to the socket whose application never calls
+`recv()`. That rules out "FreeBSD loopback doesn't do flow control" as an
+explanation, and it makes the wire capture a **fourth independent
+instrument** — alongside `netstat` `Recv-Q`, `getsockopt(SO_RCVBUF)`, and
+`FIONREAD` + drain-and-count — all agreeing.
+
+Also confirmed here: `mss 16344` in the handshake, which is what makes the
+default `R-HIWA` of 81,720 exactly 5 x MSS.
+
 ### How to frame all of this in the report
 
 The pre-flight arithmetic (85,000 B feed vs 98,304 B stock capacity)
@@ -1144,7 +1208,7 @@ Backpressure (Exp 7)
 | P1 | pending bytes vs time, per connection | ✅ data / ⬜ figure | Run E: `wbuf_hwm` 1474 B on sid=3 (backpressured) vs 17 B / 23 B on the other two — the backlog is charged to the connection that caused it. Run A adds the kernel-side contrast (slow client's `Recv-Q` → 82,535 B while the reading client stays ~0). Figure: `plot.py` → `P1_pending.png`. Note the "slow vs normal *subscriber*" framing is only available from Run A; Run E had a single subscriber. |
 | P2 | engine latency flat during P1's ramp | ✅ data / ⬜ figure | **Run E, the strongest result.** Split at the onset: pre 534,524 calls p50 4.3 µs / p99 62.6 µs; post 865,479 calls p50 3.9 µs / p99 55.0 µs → ratios ×0.91 / ×0.88, i.e. marginally *faster* under backpressure. Throughput 6,550/s → 7,364/s. Figure: `P2_engine.png`. Caveat to state: `engine_ns` brackets only `engine.handle()`, so throughput + `wchan` are what cover the write path. |
 | P3 | cumulative queued vs sent, backpressured sid | ✅ data / ⬜ figure | Run E sid=3: `queued == sent` at close, so the backlog is **transient, not standing** — 1474 B peak against 26.7 MB cumulative. Plotted as the difference series in a second panel (`P3_queued_sent.png`); two cumulative lines four orders of magnitude apart show nothing. |
-| F3 | tcpdump win 0 + zero-window probes | 🔶 **OUTSTANDING** | Run A: negative, correctly predicted (2 hits, both RST artifacts). Run D: negative. **Run E: the grep was never completed — the disk filled mid-command.** This is the one Exp 7 measurement still missing; re-run against `exp7e.pcap`. |
+| F3 | tcpdump win 0 + zero-window probes | ✅ | **Closed with a decisive result.** Run E: 1,630,569 `win 0` packets, but **all of them server→trader** (930,144 to sid=2, 700,425 to sid=3) — the server throttling *inbound* order flow. **Zero from the non-reading subscriber (port 12398).** Better than a bare negative: that subscriber advertised a constant `win 320` × `wscale 8` = **81,920 B, unchanged from its first ACK to its last, across 11,900,003 B absorbed unread**. It never shrank its window at all. See "F3, and what the wire actually shows" in Day 4. |
 | T8 | netstat -an/-x snapshots | ✅ | Run A: 4 samples (`Recv-Q` 29,206→45,390→65,008→82,535 vs ~0 for the reading client). Run D: 7 samples (12,223→83,266 against `R-HIWA`=8192). Run E: 5 samples. Column semantics settled — see "The `netstat -x` column question" in Day 4. |
 | T9 | counters, null run vs positive run | ✅ | **Axis reframed**: the original "Run A vs Run B" contrast is void, because buffer-shrinking changes nothing on this path (Runs B and D both null). The real contrast is harness-scale/null (A, B, D: `send_would_block`=0, hwm 17 B, 85,003 B offered) vs volume-forced/positive (E: `send_would_block`=66, hwm 1474 B, 11.9 MB offered to one subscriber). |
 | W1 | ps -o wchan during the flood: kqread | ✅ | `kqread` on every sample in Runs A, D and E, including at peak backlog. One Run E sample caught the loop in `Rs` (running, mid-iteration) rather than blocked — which is the same conclusion: never `sbwait`. |
@@ -1212,10 +1276,13 @@ Architecture and lifecycle
   VM. **Report it at exactly this confidence level:** the observation and its
   isolation are solid; the mechanism is stated as the most consistent
   explanation, not as a demonstrated one.
-- **OUTSTANDING — F3.** The `win 0` search on `exp7e.pcap` was never
-  completed (disk filled mid-command). Until it is, the report cannot state
-  whether genuine zero-window advertisements accompanied Run E's 66
-  `send_would_block` events. Re-run it.
+- **RESOLVED — F3.** The `win 0` search on `exp7e.pcap` is complete and the
+  result sharpens K1 rather than complicating it: zero zero-window packets
+  from the non-reading subscriber, which instead advertised a *constant*
+  81,920-byte window across all 11.9 MB it absorbed. All 1,630,569 hits are
+  the server throttling inbound order flow, which doubles as an in-capture
+  control proving this kernel does perform receiver flow control when the
+  application actually reads. See Day 4.
 
 ## Things to remember to say in the viva
 
