@@ -1,31 +1,36 @@
 #!/usr/bin/env python3
 """
-Exchange Server -- Day-0 connection-layer stub   (COL334 A2, "The Socket Exchange")
+Exchange Server   (COL334 A2, "The Socket Exchange")
 
 WHAT THIS FILE IS
-    The transport layer, built exactly as the finished server will be:
-    socket/bind/listen/accept driven by a single-threaded select.kqueue()
-    event loop, with per-connection read draining, FIN vs RST discrimination,
-    a userspace output buffer with lazily-registered write notification,
-    deferred close (reap-after-batch), and full tracing.
+    The complete server: socket/bind/listen/accept driven by a single-threaded
+    select.kqueue() event loop, with per-connection read draining, FIN vs RST
+    discrimination, a userspace output buffer with lazily-registered write
+    notification, deferred close (reap-after-batch), and full tracing.
 
-WHAT THIS FILE IS NOT (yet)
-    It does not parse the application protocol.  Phase 1 plugs in at the one
-    marked TODO in handle_readable_bytes():
+    This file owns the transport layer and nothing else.  The application
+    protocol lives in three modules that never import socket, which is the
+    invariant the whole design rests on:
+
         framing.py    newline framing over the per-connection rbuf
         protocol.py   LOGIN / BUY / SELL / CANCEL / SUBSCRIBE / ... validation
         engine.py     order book, matching, subscriptions, sessions
-    The inline line-splitter below is throwaway observability scaffolding so
-    that Experiments 1-3 already produce evidence tonight; framing.py replaces
-    it wholesale.
 
-GATE THIS MUST PASS  (roadmap §6, Day 0)
-        python3 experiment.py 1
-    Start, survive experiment.py's SO_LINGER{1,0} readiness probe -- an
-    abortive RST arriving as the very first client, before any experiment
-    begins -- accept the experiment client, and hold the idle connection open
-    indefinitely.  No idle timeouts, ever: Experiments 1, 2, 5 and 6 all use
-    connections that send nothing at all.
+    handle_readable_bytes() is the seam: it feeds bytes to the framer, hands
+    each complete line to protocol.parse_line(), and passes the result to
+    engine.handle(), which returns a list of (sid, message) pairs.  The engine
+    therefore has no way to reach a socket, and TCP backpressure has no path
+    to the matching engine.  That is the entire answer to Experiment 7, and it
+    is grep-checkable:
+
+        grep -ln 'import socket' src/*.py    # server.py, trader.py, market_data.py only
+
+BEHAVIOUR THE HARNESS DEPENDS ON
+    experiment.py opens with an SO_LINGER{1,0} readiness probe -- an abortive
+    RST arriving as the very first client, before any experiment begins.  It
+    must be absorbed without disturbing the loop.  And there are no idle
+    timeouts, ever: Experiments 1, 2, 5 and 6 all use connections that send
+    nothing at all, and Experiment 4 parks a partial line forever.
 
 CONCURRENCY / I-O DECISION  (report §8.1, README)
     Single-threaded event loop over select.kqueue(), called directly.
@@ -397,24 +402,24 @@ class Server:
         # engine.on_disconnect is the SOLE authority for session/subscription
         # cleanup (usernames, subs) and for computing the §2.6 proof metric.
         # It does NOT touch orders/level -- resting orders survive by design.
+        # Role commitment lives in engine.Session, not in Conn -- there is
+        # deliberately no second, parallel copy to drift out of sync.  Read it
+        # BEFORE on_disconnect(), which pops the session.
+        _sess = self.engine.sessions.get(c.sid)
+        role_name = ROLE_NAME[_sess.role if _sess is not None else c.role]
+
         surviving_orders = self.engine.on_disconnect(c.sid)
 
-        # NOTE (Phase 3 decision point, not resolved here): c.role below is
-        # never mutated anywhere in this file -- role commitment now lives
-        # entirely in engine.Session, set only during handle_readable_bytes'
-        # eventual real wiring. Once that wiring lands, prefer reading the
-        # role for this trace line from self.engine.sessions.get(c.sid)
-        # (captured BEFORE the on_disconnect() call above, since that pops
-        # the session) rather than maintaining a second, parallel Conn.role.
         tracelog.emit("close", sid=c.sid, fd=c.fd, why=why,
-                      role=ROLE_NAME[c.role], recvs=c.n_recv,
+                      role=role_name, recvs=c.n_recv,
                       bytes_in=c.bytes_in, queued=c.queued, sent=c.sent,
                       eagain=c.eagain, wbuf_hwm=c.wbuf_hwm,
                       orders_surviving=surviving_orders)
 
         # Notifications addressed to this sid now drop (see queue_out).
         self.by_sid.pop(c.sid, None)
-        # TODO Phase 2: subs[i].discard(c.sid); usernames.discard(c.user)
+        # subs/usernames cleanup already happened above, inside
+        # engine.on_disconnect() -- it is the sole authority for it.
         #      and DO NOT touch the order book -- resting orders survive (§2.6).
         self.reap.append(c.fd)
 
