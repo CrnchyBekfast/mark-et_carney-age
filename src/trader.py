@@ -55,6 +55,7 @@ def main() -> None:
     ], 0)
 
     fr = framing.Framer()
+    quitting = False
 
     try:
         while True:
@@ -81,7 +82,7 @@ def main() -> None:
                         print("[server sent an oversized line -- disconnecting]",
                               file=sys.stderr)
                         return
-                else:
+                elif not quitting:
                     line = sys.stdin.readline()
                     if not line:                      # EOF on stdin
                         return
@@ -94,7 +95,25 @@ def main() -> None:
                         print("[send failed: %r]" % e, file=sys.stderr)
                         return
                     if line.upper() == "QUIT":
-                        return
+                        # §2.2.5 graceful disconnection, and the one place the
+                        # shutdown() required by §4.1 genuinely belongs: close
+                        # our write direction so the server sees a clean EOF,
+                        # then keep reading until it closes from its end. Any
+                        # BOUGHT/SOLD the server had already queued still
+                        # arrives -- a bare close() here could discard it.
+                        try:
+                            s.shutdown(socket.SHUT_WR)
+                        except OSError:
+                            pass
+                        try:
+                            kq.control([select.kevent(ifd,
+                                                      select.KQ_FILTER_READ,
+                                                      select.KQ_EV_DELETE)], 0)
+                        except OSError:
+                            pass
+                        quitting = True
+                        print("[sent QUIT; half-closed, awaiting server close]",
+                              file=sys.stderr, flush=True)
     except KeyboardInterrupt:
         pass
     finally:

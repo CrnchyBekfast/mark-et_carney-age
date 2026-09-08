@@ -82,7 +82,7 @@ class Conn:
     """
 
     __slots__ = ("sock", "fd", "sid", "role", "user", "subs",
-                 "framer", "wbuf", "woff", "wwatch", "dead",
+                 "framer", "wbuf", "woff", "wwatch", "dead", "quitting",
                  "n_recv", "bytes_in", "queued", "sent", "eagain", "wbuf_hwm")
 
     def __init__(self, sock, sid):
@@ -98,6 +98,7 @@ class Conn:
         self.woff     = 0             # consumed prefix (offset, not erase)
         self.wwatch   = False         # is KQ_FILTER_WRITE currently enabled?
         self.dead     = False         # reap AFTER the batch, never mid-batch
+        self.quitting = False         # QUIT seen: close once wbuf drains (§2.2.5)
         self.n_recv   = 0
         self.bytes_in = 0
         self.queued   = 0
@@ -313,6 +314,19 @@ class Server:
                     return
                 continue
 
+            # §2.2.5 -- QUIT requests a *graceful* disconnection.  It is
+            # handled here rather than inside engine.handle(), because the
+            # engine must never learn that connections exist at all: that
+            # invariant is exactly what Experiment 7 rests on.  flush()
+            # performs the actual close once anything already queued for this
+            # client has drained, so a QUIT never truncates output the server
+            # had already promised.
+            if payload[0] == b"QUIT":
+                c.quitting = True
+                self.flush(c)
+                return          # anything after QUIT in this batch is
+                                # discarded -- the client asked to leave
+
             t0 = time.monotonic_ns()
             results = self.engine.handle(c.sid, payload)
             engine_ns = time.monotonic_ns() - t0
@@ -392,6 +406,14 @@ class Server:
         del c.wbuf[:]
         c.woff = 0
         self.want_write(c, False)
+
+        # The buffer is now empty.  If a QUIT is pending, this is the moment
+        # the graceful close becomes safe -- everything the client was owed
+        # has reached the kernel.  Reached from both call sites: the inline
+        # flush in handle_readable_bytes, and the KQ_FILTER_WRITE path after
+        # a backlog finally drains.
+        if c.quitting:
+            self.kill(c, "quit")
 
     # -- teardown ---------------------------------------------------------
     def kill(self, c: Conn, why: str) -> None:

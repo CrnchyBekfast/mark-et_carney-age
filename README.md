@@ -52,11 +52,21 @@ harness's `killpg` does not truncate the trace file.
 ./client/run-market-data 127.0.0.1 5000 JNST
 ```
 
-The Trader Client sends `LOGIN <username>` on connect, then reads protocol
-commands from stdin (`BUY`, `SELL`, `CANCEL`, `QUIT`) while concurrently
-displaying anything the server pushes. The Market-Data Client sends
-`SUBSCRIBE <instrument>` for each instrument given and then prints updates as
-they arrive.
+Both clients multiplex stdin and the socket with `select.kqueue()`, so
+commands can be typed while the server is pushing asynchronous notifications.
+A client that only alternated request/response could not display a `BOUGHT`
+that arrives while the user is mid-typing (§2.3, §2.7).
+
+| client | sent on connect | accepted on stdin |
+|---|---|---|
+| Trader | `LOGIN <username>` | `BUY`, `SELL`, `CANCEL`, `QUIT` |
+| Market-Data | `SUBSCRIBE <instrument>` per argument | `SUBSCRIBE`, `UNSUBSCRIBE`, `QUIT` |
+
+`QUIT` performs a graceful disconnection: the client sends `QUIT`, calls
+`shutdown(SHUT_WR)` to half-close its write direction, and keeps reading until
+the server closes from its end — so anything the server had already queued
+still arrives. The server likewise defers its close until that connection's
+output buffer has drained.
 
 Supported instruments: `JNST`, `IMCT`.
 
