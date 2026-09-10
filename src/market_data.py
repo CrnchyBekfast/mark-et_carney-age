@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""
-Market-Data Client   (COL334 A2)
-
-    run-market-data <host> <port> <instrument> [instrument ...]
-
-Read-only with respect to trading (§2.4): only SUBSCRIBE, UNSUBSCRIBE and QUIT
-are permitted. The instruments named on the command line are subscribed on
-connect; TRADE updates are then printed as the server pushes them.
-
-WHY THIS CLIENT MULTIPLEXES
-    §2.8 lists SUBSCRIBE, UNSUBSCRIBE *and* QUIT as Market-Data Client
-    messages. A client that only ever read its socket could not offer
-    UNSUBSCRIBE at all without disconnecting first, and could not issue a
-    graceful QUIT. So stdin and the socket are both registered with
-    select.kqueue() -- the same mechanism the server uses -- and commands may
-    be typed while updates are arriving.
-
-    Commands accepted on stdin:  SUBSCRIBE <instr> | UNSUBSCRIBE <instr> | QUIT
-
-FRAMING
-    Uses framing.Framer for the inbound stream, so multiple TRADE lines
-    coalesced into one segment, or one TRADE split across two recv()s, are
-    both handled correctly rather than corrupting the display. This matters
-    here in particular: the server emits one TRADE per match, and a burst of
-    matches can arrive as a single segment.
-"""
 
 from __future__ import annotations
 

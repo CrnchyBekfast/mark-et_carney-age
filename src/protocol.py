@@ -1,21 +1,4 @@
-"""
-Protocol constants -- COL334 A2, "The Socket Exchange"
-
-Scaffolding only: the fixed ERROR <reason> vocabulary and instrument names.
-The actual line parser (LOGIN/BUY/SELL/CANCEL/SUBSCRIBE/UNSUBSCRIBE/QUIT
-validation, parse_u32, etc. -- roadmap §3) is Phase 1 work and belongs here,
-written by hand rather than scaffolded, since it's exactly what the viva will
-probe.
-
-<reason> is free-form per §2.1/§2.2 of the handout -- the spec does not fix a
-vocabulary. Defining one FIXED set and using it everywhere (never an ad hoc
-string at the call site) is what makes ERROR replies greppable in test output
-and in the report, and it is what README §9 documents to the grader.
-"""
-
-# ---------------------------------------------------------------------------
-# ERROR <reason> vocabulary  (roadmap §3)
-# ---------------------------------------------------------------------------
+#error vocab
 REASON_UNKNOWN_COMMAND      = b"unknown_command"        # verb not one of the 7
 REASON_BAD_ARITY            = b"bad_arity"              # wrong token count
 REASON_BAD_INSTRUMENT       = b"bad_instrument"         # not JNST or IMCT
@@ -30,21 +13,15 @@ REASON_ORDER_NOT_CANCELLABLE = b"order_not_cancellable" # already fully filled/c
 REASON_NOT_OWNER            = b"not_owner"              # CANCEL of someone else's order
 REASON_LINE_TOO_LONG        = b"line_too_long"          # rbuf exceeded MAX_LINE, no '\n' seen
 
-# ---------------------------------------------------------------------------
-# Instruments  (§2.1: exactly two, nothing else is valid)
-# ---------------------------------------------------------------------------
+#instruments
 JNST, IMCT = 0, 1
 INSTRUMENT_NAME = {JNST: b"JNST", IMCT: b"IMCT"}
 INSTRUMENT_CODE = {v: k for k, v in INSTRUMENT_NAME.items()}   # b"JNST" -> JNST, etc.
 
-# ---------------------------------------------------------------------------
-# Order sides
-# ---------------------------------------------------------------------------
+#order consts
 BUY, SELL = 0, 1
 
-# ---------------------------------------------------------------------------
-# Value ranges  (§2.1, verbatim)
-# ---------------------------------------------------------------------------
+
 QTY_MIN, QTY_MAX     = 1, 2_147_483_647
 PRICE_MIN, PRICE_MAX = 1, 2_147_483_647
 OID_MIN, OID_MAX     = 0, 2_147_483_647

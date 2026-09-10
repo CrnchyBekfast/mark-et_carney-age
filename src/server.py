@@ -1,50 +1,4 @@
 #!/usr/bin/env python3
-"""
-Exchange Server   (COL334 A2, "The Socket Exchange")
-
-WHAT THIS FILE IS
-    The complete server: socket/bind/listen/accept driven by a single-threaded
-    select.kqueue() event loop, with per-connection read draining, FIN vs RST
-    discrimination, a userspace output buffer with lazily-registered write
-    notification, deferred close (reap-after-batch), and full tracing.
-
-    This file owns the transport layer and nothing else.  The application
-    protocol lives in three modules that never import socket, which is the
-    invariant the whole design rests on:
-
-        framing.py    newline framing over the per-connection rbuf
-        protocol.py   LOGIN / BUY / SELL / CANCEL / SUBSCRIBE / ... validation
-        engine.py     order book, matching, subscriptions, sessions
-
-    handle_readable_bytes() is the seam: it feeds bytes to the framer, hands
-    each complete line to protocol.parse_line(), and passes the result to
-    engine.handle(), which returns a list of (sid, message) pairs.  The engine
-    therefore has no way to reach a socket, and TCP backpressure has no path
-    to the matching engine.  That is the entire answer to Experiment 7, and it
-    is grep-checkable:
-
-        grep -ln 'import socket' src/*.py    # server.py, trader.py, market_data.py only
-
-BEHAVIOUR THE HARNESS DEPENDS ON
-    experiment.py opens with an SO_LINGER{1,0} readiness probe -- an abortive
-    RST arriving as the very first client, before any experiment begins.  It
-    must be absorbed without disturbing the loop.  And there are no idle
-    timeouts, ever: Experiments 1, 2, 5 and 6 all use connections that send
-    nothing at all, and Experiment 4 parks a partial line forever.
-
-CONCURRENCY / I-O DECISION  (report §8.1, README)
-    Single-threaded event loop over select.kqueue(), called directly.
-    Not `selectors` (it hides which syscall is in use, which is what §4.1.2
-    targets and would wreck the viva answer), not asyncio (banned by name),
-    no third-party networking libraries.
-
-ENVIRONMENT KNOBS
-    argv is fixed by the harness (<host> <port>), so every knob is an env var
-    and the launcher passes the environment through for free:
-        EXCH_TRACE=<path>    structured JSONL trace, for plotting
-        EXCH_SNDBUF=<bytes>  SO_SNDBUF on accepted sockets (Exp 7 control, §5)
-        EXCH_WBUF_MAX=<bytes>  userspace backlog cap before slow-consumer evict
-"""
 
 from __future__ import annotations
 
@@ -60,9 +14,7 @@ import engine
 import protocol
 import tracelog
 
-# ---------------------------------------------------------------------------
-# Tunables
-# ---------------------------------------------------------------------------
+
 MAX_LINE   = 4096                                         # inbound line cap (§3)
 WBUF_MAX   = int(os.environ.get("EXCH_WBUF_MAX", 4 << 20))   # 4 MiB (§5)
 READ_CHUNK = 65536

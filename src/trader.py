@@ -1,23 +1,4 @@
 #!/usr/bin/env python3
-"""
-Trader Client   (COL334 A2)
-
-    run-trader <host> <port> <username>
-
-Sends LOGIN on connect, then reads commands from stdin (BUY / SELL / CANCEL /
-QUIT) while simultaneously displaying whatever the server pushes.
-
-BOUGHT/SOLD are asynchronous (§2.3, §2.7): a trader may submit an order, get
-ORDER_ACCEPTED, and receive BOUGHT much later when a matching order arrives.
-A blocking request/response client cannot display that while the user is
-mid-typing, so stdin and the socket are both registered with
-select.kqueue() -- the same mechanism the server uses.
-
-Uses framing.Framer for the inbound socket stream: the server coalesces one
-event-loop iteration's output into a single send(), so ORDER_ACCEPTED and a
-BOUGHT can arrive in ONE segment, and a segment can also split an
-application message across two recv()s. Framer handles both directions.
-"""
 
 from __future__ import annotations
 

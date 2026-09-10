@@ -1,30 +1,4 @@
 #!/usr/bin/env python3
-"""
-Dual-channel trace logger  (COL334 A2 roadmap §7)
-
-Two channels, one call site:
-
-  stderr   human-readable, one line per event.  THIS IS YOUR SCREENSHOT
-           CHANNEL -- experiment.py does not pipe the server's stdio, so
-           whatever you write here lands directly in the terminal you are
-           photographing.  The launcher uses `python3 -u` so it appears
-           immediately without per-event flushing.
-
-  $EXCH_TRACE   structured JSONL, one object per event.  THIS IS YOUR
-           PLOTTING CHANNEL (figures P1/P2/P3).  Block-buffered on purpose:
-           flushing per event would make the instrumentation the bottleneck
-           you are trying to measure.  main() must call close() -- including
-           from the SIGTERM handler, because experiment.py kills the server
-           with SIGTERM and Python's default action would truncate the file.
-
-Usage:
-    import tracelog
-    tracelog.emit("recv", sid=3, fd=9, n=17, rbuf_after=17)
-    tracelog.close()
-
-Timestamps are milliseconds since process start, from time.monotonic_ns()
-(never wall clock -- NTP steps would corrupt latency measurements).
-"""
 
 from __future__ import annotations
 

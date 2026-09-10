@@ -1,26 +1,5 @@
 #!/usr/bin/env python3
-"""
-Naive blocking-server CONTROL -- COL334 A2, artifact T5 (roadmap §8.4).
 
-THIS FILE IS NOT PART OF THE GRADED SUBMISSION. It exists solely to give
-Experiment 4 a deliberately-wrong architecture to contrast against: a
-single-threaded server that calls blocking accept() and blocking recv() in
-one straight-line loop, with no select/poll/kqueue multiplexing at all.
-
-The point it proves: Client 1 sends 20 bytes with no trailing '\n' and then
-goes silent. This server's recv() call for Client 1 blocks forever waiting
-for more bytes (or EOF) that never come -- and because accept() for the
-NEXT client only runs after handle_client() returns, Client 2 can never
-even be accept()ed, let alone served, for as long as Client 1's connection
-stays open. Contrast this file's `ps -o wchan` reading (`sbwait`, blocked
-in a socket read) against src/server.py's (`kqread`, blocked in kevent())
--- that one-word difference is T5's entire proof.
-
-Protocol handling here is intentionally minimal -- just enough to answer
-Experiment 4's LOGIN lines with "OK\n". It is not framing.py/protocol.py/
-engine.py; reusing those would be pointless because the whole point of this
-file is the I/O model, not the parsing.
-"""
 
 from __future__ import annotations
 
@@ -29,10 +8,9 @@ import sys
 
 
 def handle_client(conn: socket.socket, addr) -> None:
-    """
-    Fully blocking, one connection at a time. Never returns while the
-    client stays open and silent -- that's the entire demonstration.
-    """
+
+    #fully blocking the connection
+    
     rbuf = bytearray()
     while True:
         data = conn.recv(4096)          # BLOCKING -- no timeout, no select
