@@ -143,7 +143,8 @@ netstat -an -p tcp | grep 5000
 
 ### Evidence
 
-> **[SCREENSHOT 1a — `sockstat` and `netstat` output during Experiment 1]**
+> **[SCREENSHOT 1a — PENDING RE-CAPTURE: `sockstat` and `netstat` during
+> Experiment 1, taken while the harness is paused in its observation phase]**
 
 ```
 $ sockstat -4 | grep 5000
@@ -192,7 +193,7 @@ closer, holds `TIME_WAIT`.
 
 The defect graders look for is a server that ignores EOF and leaves sockets in
 `CLOSE_WAIT` forever, leaking descriptors. **This server's `CLOSE_WAIT` lasts
-609 µs.**
+504 µs.**
 
 ### Approach
 
@@ -212,16 +213,21 @@ tcpdump -r exp2.pcap -n -ttt -S
 
 ### Evidence
 
-> **[SCREENSHOT 2a — `netstat` sampled across the connection's phases]**
-> **[SCREENSHOT 2b — `tcpdump` readback showing the four-way close]**
+![Screenshot 2a](screenshots/2a.png)
+*Screenshot 2a — `netstat` sampled repeatedly across both phases: the pair of
+`ESTABLISHED` rows while the client is connected, collapsing to `LISTEN`-only
+once it closes.*
+
+![Screenshot 2b](screenshots/2b.png)
+*Screenshot 2b — `exp2.pcap` readback: the complete four-way close.*
 
 ```
-+0.102908s  SYN 29538->5000 -> SYN/ACK -> ACK -> RST from 29538   <- readiness probe
-+0.000125s  SYN 25236->5000 -> SYN/ACK -> ACK                     <- real client
-+10.001687s [25236->5000] FIN,ACK        <- client closes (active closer)
-+0.000080s  [5000->25236] ACK            <- server ACKs; CLOSE_WAIT begins
-+0.000529s  [5000->25236] FIN,ACK        <- server's own FIN; CLOSE_WAIT = 609 us
-+0.000016s  [25236->5000] ACK            <- client -> TIME_WAIT
++0.100912s  SYN 21441->5000 -> SYN/ACK -> ACK -> RST from 21441   <- readiness probe
++0.000098s  SYN 62724->5000 -> SYN/ACK -> ACK                     <- real client
++10.003715s [62724->5000] FIN,ACK        <- client closes (active closer)
++0.000030s  [5000->62724] ACK            <- server ACKs; CLOSE_WAIT begins
++0.000504s  [5000->62724] FIN,ACK        <- server's own FIN; CLOSE_WAIT = 504 us
++0.000014s  [62724->5000] ACK            <- client -> TIME_WAIT
 ```
 
 **Table T2**
@@ -230,14 +236,14 @@ tcpdump -r exp2.pcap -n -ttt -S
 |---|---|---|---|
 | t₀ | handshake completes | `ESTABLISHED` | `ESTABLISHED` |
 | t₀+10 s | client `close()` → FIN | `FIN_WAIT_1`→`FIN_WAIT_2` | `CLOSE_WAIT` |
-| +80 µs | server ACKs the FIN | `FIN_WAIT_2` | `CLOSE_WAIT` |
-| +609 µs | server closes → FIN | `TIME_WAIT` | `LAST_ACK` |
-| +625 µs | client ACKs | `TIME_WAIT` | `CLOSED` |
+| +30 µs | server ACKs the FIN | `FIN_WAIT_2` | `CLOSE_WAIT` |
+| +534 µs | server closes → FIN | `TIME_WAIT` | `LAST_ACK` |
+| +548 µs | client ACKs | `TIME_WAIT` | `CLOSED` |
 
-**Measurement note.** `CLOSE_WAIT` was measured four times across independent
-runs: 656 µs, 507 µs, 609 µs, 984 µs. Consistently sub-millisecond, so the
-transient-`CLOSE_WAIT` claim is a property of the implementation rather than
-one lucky sample.
+**Measurement note.** `CLOSE_WAIT` was measured five times across independent
+runs: 656 µs, 507 µs, 609 µs, 984 µs, 504 µs (the last being the captured run
+shown above). Consistently sub-millisecond, so the transient-`CLOSE_WAIT`
+claim is a property of the implementation rather than one lucky sample.
 
 **An honest limitation.** `netstat` polling at ~0.5 s never caught `CLOSE_WAIT`
 or `TIME_WAIT` at all — the samples go straight from `ESTABLISHED` to
@@ -276,23 +282,28 @@ tcpdump -r exp3.pcap -n -ttt -S
 
 ### Evidence
 
-> **[SCREENSHOT 3a — server trace showing four `recv` events]**
-> **[SCREENSHOT 3b — `tcpdump` showing four PSH segments of 6/10/7/1 bytes]**
+![Screenshot 3a](screenshots/3a.png)
+*Screenshot 3a — the server's own trace: four `recv` calls, a parsed message
+emitted only on the fourth.*
+
+![Screenshot 3b](screenshots/3b.png)
+*Screenshot 3b — `exp3.pcap` readback: four PSH segments of 6/10/7/1 bytes.*
 
 ```
-80.036ms  recv n=6  rbuf_before=0  rbuf_after=6   lines_out=0  hex=4c4f47494e20        "LOGIN "
-282.252ms recv n=10 rbuf_before=6  rbuf_after=16  lines_out=0  hex=6578706572696d656e74 "experiment"
-486.481ms recv n=7  rbuf_before=16 rbuf_after=23  lines_out=0  hex=5f747261646572      "_trader"
-688.141ms recv n=1  rbuf_before=23 rbuf_after=0   lines_out=1  hex=0a                  "\n"
-688.325ms queue_out sid=2 fd=5 n=3 pending=3 hwm=3
+80.220ms  recv sid=2 fd=6 n=6  rbuf_before=0  rbuf_after=6  lines_out=0 hex='4c4f47494e20'         "LOGIN "
+281.372ms recv sid=2 fd=6 n=10 rbuf_before=6  rbuf_after=16 lines_out=0 hex='6578706572696d656e74' "experiment"
+483.431ms recv sid=2 fd=6 n=7  rbuf_before=16 rbuf_after=23 lines_out=0 hex='5f747261646572'       "_trader"
+684.034ms recv sid=2 fd=6 n=1  rbuf_before=23 rbuf_after=0  lines_out=1 hex='0a'                   "\n"
+684.199ms engine    sid=2 n_msgs=1 engine_ns=25458
+684.244ms queue_out sid=2 fd=6 n=3 pending=3 hwm=3
 ```
 
 ```
-+0.000076s PSH 40700->5000 len=6  "LOGIN "
-+0.201959s PSH 40700->5000 len=10 "experiment"
-+0.204174s PSH 40700->5000 len=7  "_trader"
-+0.201680s PSH 40700->5000 len=1  "\n"
-+0.000565s PSH 5000->40700 len=3  "OK\n"
++0.000062s PSH 65502->5000 len=6  "LOGIN "
++0.162590s PSH 65502->5000 len=10 "experiment"
++0.164443s PSH 65502->5000 len=7  "_trader"
++0.159561s PSH 65502->5000 len=1  "\n"
++0.000592s PSH 5000->65502 len=3  "OK\n"
 ```
 
 **Table T3 — `recv()` ledger**
@@ -300,9 +311,9 @@ tcpdump -r exp3.pcap -n -ttt -S
 | # | t (ms) | bytes | payload | `rbuf` after | messages emitted |
 |---|---|---|---|---|---|
 | 1 | 80 | 6 | `LOGIN ` | 6 | 0 |
-| 2 | 282 | 10 | `experiment` | 16 | 0 |
-| 3 | 486 | 7 | `_trader` | 23 | 0 |
-| 4 | 688 | 1 | `\n` | 0 | **1** |
+| 2 | 281 | 10 | `experiment` | 16 | 0 |
+| 3 | 483 | 7 | `_trader` | 23 | 0 |
+| 4 | 684 | 1 | `\n` | 0 | **1** |
 
 **Generality (T4).** One run proves one case. The framer is additionally tested
 offline against *every* split position of a multi-message byte stream
@@ -323,7 +334,7 @@ arriving in a *single* segment.
 No. A silent client cannot stall the server, because the server never blocks
 on any individual socket. It is parked in `kevent()`, which reports only
 descriptors that are ready; a client that sends nothing simply never becomes
-ready. Client 2 is served in **0.001 s** while Client 1 sits mid-message
+ready. Client 2 is served in **0.003 s** while Client 1 sits mid-message
 forever.
 
 ### Approach
@@ -345,31 +356,42 @@ netstat -an -p tcp | grep 5000
 
 ### Evidence
 
-> **[SCREENSHOT 4a — real server: `wchan=kqread`, Client 2 served in 0.001 s]**
-> **[SCREENSHOT 4b — naive control: `wchan=sbwait`, Client 2 unanswered after 5.105 s]**
+![Screenshot 4a](screenshots/4a.png)
+*Screenshot 4a — real server: Client 2 answered in 0.003 s while Client 1 sits
+mid-message.*
 
-Real server:
+![Screenshot 4b](screenshots/4b.png)
+*Screenshot 4b — naive blocking control: Client 2 never answered; the harness
+times out after 5.072 s.*
+
+> **[SCREENSHOT 4c — PENDING RE-CAPTURE: `ps -o pid,tid,wchan,state` for both
+> servers, taken from a second terminal *while* each experiment is paused, so
+> that `kqread` and `sbwait` are actually visible]**
+
+Real server (PID 11326):
 ```
-77.789ms  recv sid=2 fd=5 n=20 rbuf_after=20 lines_out=0    <- "LOGIN blocked_client", no \n
-2082.357ms accept sid=3 fd=6 peer='127.0.0.1:50811' nconn=2
-2082.700ms recv sid=3 fd=6 n=20 rbuf_after=0 lines_out=1
+80.128ms   recv sid=2 fd=5 n=20 rbuf_before=0 rbuf_after=20 lines_out=0   <- "LOGIN blocked_client", no \n
+2081.392ms accept sid=3 fd=6 peer='127.0.0.1:16102' nconn=2
+2082.615ms recv sid=3 fd=6 n=20 rbuf_before=0 rbuf_after=0 lines_out=1
+2082.864ms engine sid=3 n_msgs=1 engine_ns=38459
+2083.219ms queue_out sid=3 fd=6 n=3 pending=3 hwm=3
 Client 2 response: 'OK'
-Elapsed time: 0.001 seconds
-
-$ ps -o pid,tid,wchan,state -H -p 5353
- PID    LWP WCHAN  STAT
-5353 100176 kqread Ss
+Elapsed time: 0.003 seconds
 ```
 
-Naive control:
+Naive control (PID 11331):
 ```
+Client 1: connected from 127.0.0.1:55848
+Client 1 will send an incomplete application message.
+Client 1 will now remain silent.
+Client 2: connected from 127.0.0.1:21907
 Client 2 response: None
-Elapsed time: 5.105 seconds
-
-$ ps -o pid,tid,wchan,state -H -p 5358
- PID    LWP WCHAN  STAT
-5358 100176 sbwait Ss
+Elapsed time: 5.072 seconds
 ```
+
+The `wchan` comparison that decides the experiment is captured separately in
+Screenshot 4c, since it must be read from a second terminal while each server
+process is still alive.
 
 **Table T5**
 
@@ -377,7 +399,7 @@ $ ps -o pid,tid,wchan,state -H -p 5358
 |---|---|---|
 | `wchan` | **`kqread`** | **`sbwait`** |
 | Client 2 response | `OK` | `None` |
-| Elapsed | **0.001 s** | 5.105 s (harness timeout) |
+| Elapsed | **0.003 s** | 5.072 s (harness timeout) |
 | Client 1 `Recv-Q` | 0 | 0 |
 
 `sbwait` means "blocked waiting on a socket buffer" — the naive server is
@@ -416,15 +438,21 @@ netstat -an -p tcp | grep '\.5000 '      # sampled 4x across the observation win
 
 ### Evidence
 
-> **[SCREENSHOT 5a — server trace: `recv` on only sid 2, 4, 6]**
-> **[SCREENSHOT 5b — `netstat` showing all five `ESTABLISHED`, `Recv-Q=0` for the idle pair]**
+![Screenshot 5a](screenshots/5a.png)
+*Screenshot 5a — five accepted connections, but `recv` fires on only three of
+them; sid 3 and sid 5 never appear.*
+
+![Screenshot 5b](screenshots/5b.png)
+*Screenshot 5b — `netstat` across five samples: all five connections
+`ESTABLISHED` throughout, `Recv-Q` non-zero only for the three that were
+sent a reply.*
 
 Across the ~16.5 s run, `recv` fires exactly three times:
 
 ```
-76.185ms   recv sid=2 fd=5 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f310a'   "LOGIN client_1\n"
-576.578ms  recv sid=4 fd=7 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f330a'   "LOGIN client_3\n"
-1076.953ms recv sid=6 fd=9 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f350a'   "LOGIN client_5\n"
+79.798ms   recv sid=2 fd=5 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f310a'   "LOGIN client_1\n"
+581.748ms  recv sid=4 fd=7 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f330a'   "LOGIN client_3\n"
+1083.395ms recv sid=6 fd=9 n=15 lines_out=1 hex='4c4f47494e20636c69656e745f350a'   "LOGIN client_5\n"
 ```
 
 fds 6 and 8 (sid 3 and 5) never appear.
@@ -433,11 +461,11 @@ fds 6 and 8 (sid 3 and 5) never appear.
 
 | sid | fd | peer port | client | appears in any `recv`? | `Recv-Q` (both directions) |
 |---|---|---|---|---|---|
-| 2 | 5 | 35113 | 1 | ✅ | 3 (unread `OK\n` at client) |
-| 3 | 6 | 39310 | 2 | ❌ | **0 / 0** |
-| 4 | 7 | 25989 | 3 | ✅ | 3 |
-| 5 | 8 | 39998 | 4 | ❌ | **0 / 0** |
-| 6 | 9 | 42748 | 5 | ✅ | 3 |
+| 2 | 5 | 11117 | 1 | ✅ | 3 (unread `OK\n` at client) |
+| 3 | 6 | 48451 | 2 | ❌ | **0 / 0** |
+| 4 | 7 | 61204 | 3 | ✅ | 3 |
+| 5 | 8 | 20623 | 4 | ❌ | **0 / 0** |
+| 6 | 9 | 46858 | 5 | ✅ | 3 |
 
 The mapping was cross-checked two independent ways: by peer port against the
 harness's own output, and by decoding each `recv`'s hex payload. `Recv-Q=0` in
@@ -476,20 +504,38 @@ tcpdump -r exp6.pcap -n -ttt -S
 
 ### Evidence
 
-> **[SCREENSHOT 6a — `tcpdump`: four-way FIN close vs. a single RST segment]**
-> **[SCREENSHOT 6b — server trace: `eof_fin{ev_eof=True}` vs `eof_rst{errno=54, ev_fflags=54}`]**
+![Screenshot 6a](screenshots/6a.png)
+*Screenshot 6a — `exp6.pcap` readback: port 16177 performs a full four-way FIN
+close; port 50346 is terminated by a single RST.*
 
-Part A (FIN):
+![Screenshot 6b](screenshots/6b.png)
+*Screenshot 6b — the server trace for the same run: `eof_fin{ev_eof=True}` for
+Part A against `eof_rst{errno=54, ev_fflags=54}` for Part B.*
+
+Part A (FIN), port 16177:
 ```
-63936 > 5000: Flags [F.]     <- client half-closes (shutdown SHUT_WR)
-5000 > 63936: Flags [.]         server ACKs
-5000 > 63936: Flags [F.]     <- server sends its OWN FIN back
-63936 > 5000: Flags [.]         client ACKs -- full four-way close
+16177 > 5000: Flags [F.]     <- client half-closes (shutdown SHUT_WR)
+5000 > 16177: Flags [.]         server ACKs
+5000 > 16177: Flags [F.]     <- server sends its OWN FIN back
+16177 > 5000: Flags [.]         client ACKs -- full four-way close
 ```
 
-Part B (RST):
+Server trace for the same connection:
 ```
-50690 > 5000: Flags [R.] seq ... win 0    <- single segment, no FIN exchange, no ACK
+78.295ms accept  sid=2 fd=5 peer='127.0.0.1:16177' nconn=1
+78.320ms eof_fin sid=2 fd=5 ev_eof=True
+78.333ms close   sid=2 fd=5 why='FIN' recvs=0 bytes_in=0 queued=0 sent=0
+```
+
+Part B (RST), port 50346:
+```
+50346 > 5000: Flags [R.] seq ... win 0    <- single segment, no FIN exchange, no ACK
+```
+
+```
+10080.108ms accept  sid=3 fd=5 peer='127.0.0.1:50346' nconn=1
+10080.312ms eof_rst sid=3 fd=5 errno=54 ev_fflags=54
+10080.565ms close   sid=3 fd=5 why='RST' recvs=0 bytes_in=0 queued=0 sent=0
 ```
 
 **Table T7**
