@@ -17,7 +17,7 @@ class Framer:
             lines.append(line)
             start = nl + 1
         if start:
-            del self.buf[:start]        # ONE compaction per feed() call
+            del self.buf[:start]
         yield from lines
 
     def overflowed(self) -> bool:

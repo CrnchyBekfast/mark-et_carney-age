@@ -1,7 +1,5 @@
 from collections import deque
-from protocol import (
-    JNST, IMCT, BUY, SELL, INSTRUMENT_NAME
-)
+from protocol import JNST, IMCT, BUY, SELL, INSTRUMENT_NAME
 
 UNTYPED, TRADER, MARKETDATA = 0, 1, 2
 
@@ -34,28 +32,23 @@ class Engine:
         if verb == b"LOGIN":
             return self._on_login(sid, session, parsed[1])
 
-        if verb in (b"BUY", b"SELL"):
+        if verb in (b"BUY", b"SELL", b"CANCEL"):
             if session.role not in (UNTYPED, TRADER):
                 return [(sid, b"ERROR wrong_role\n")]
             if session.role == UNTYPED:
                 return [(sid, b"ERROR not_logged_in\n")]
+            if verb == b"CANCEL":
+                return self.on_cancel(sid, parsed[1])
             side = BUY if verb == b"BUY" else SELL
             _, instr, qty, price = parsed
             return self._on_buy_sell(sid, side, instr, qty, price)
-
-        if verb == b"CANCEL":
-            if session.role not in (UNTYPED, TRADER):
-                return [(sid, b"ERROR wrong_role\n")]
-            if session.role == UNTYPED:
-                return [(sid, b"ERROR not_logged_in\n")]
-            return self.on_cancel(sid, parsed[1])
 
         if verb in (b"SUBSCRIBE", b"UNSUBSCRIBE"):
             if session.role not in (UNTYPED, MARKETDATA):
                 return [(sid, b"ERROR wrong_role\n")]
             return self._on_sub_unsub(sid, session, verb, parsed[1])
 
-        raise AssertionError("unreachable: protocol.py's 7-verb set must match this dispatch")
+        return [(sid, b"ERROR unknown_command\n")]
 
     def _on_login(self, sid, session, username: bytes):
         if session.role != UNTYPED:
@@ -68,7 +61,7 @@ class Engine:
         return [(sid, b"OK\n")]
 
     def _on_sub_unsub(self, sid, session, verb, instr):
-        if session.role == UNTYPED and verb == b"SUBSCRIBE":
+        if session.role == UNTYPED:
             session.role = MARKETDATA
         if verb == b"SUBSCRIBE":
             self.subs[instr].add(sid)
@@ -120,6 +113,15 @@ class Engine:
             return [(sid, b"ERROR order_not_cancellable\n")]
         o.cancelled = True
         o.qty_left = 0
+        key = (o.instr, o.side, o.price)
+        dq = self.level.get(key)
+        if dq:
+            try:
+                dq.remove(order_id)
+            except ValueError:
+                pass
+            if not dq:
+                del self.level[key]
         return [(sid, b"ORDER_CANCELLED %d\n" % order_id)]
 
     def on_disconnect(self, sid: int) -> int:

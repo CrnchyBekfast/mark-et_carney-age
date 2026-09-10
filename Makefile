@@ -24,7 +24,7 @@ md:
 structure:
 	sh src/tools/check_structure.sh
 
-# make zip R1=2024CS10388 R2=2024CS10999
+# make zip R1=2024CS10388 R2=2024AM10224
 zip:
 	sh src/tools/make_zip.sh $(R1) $(R2)
 

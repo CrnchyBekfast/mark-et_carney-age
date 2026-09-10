@@ -1,11 +1,6 @@
 # The Socket Exchange — COL334 Assignment 2
 
-Team: 2024CS10388, `<partner roll>`
-
-> **Status: Day-0 scaffold.** The connection layer (sockets, event loop,
-> framing buffers, teardown, tracing) is in place. The application protocol
-> — framing rules, command validation, order book and matching — is not yet
-> implemented. Sections marked *TODO* below must be completed before submission.
+Team: 2024CS10388 (Amar Sinha), 2024AM10224 (Ritwik Sehrawat)
 
 ---
 
@@ -126,18 +121,15 @@ src/tools/baseline.sh        capture OS/sysctl baseline for the report
 src/tools/check_structure.sh pre-submission structure validation
 src/tools/make_zip.sh        build the correctly-named submission archive
 README.md
-report.pdf                   experiment report (TODO)
+report.pdf                   experiment report
 ```
-
-*TODO (Phase 1–2):* `src/framing.py`, `src/protocol.py`, `src/engine.py`,
-`tests/`.
 
 ## 8. Development helpers
 
 ```sh
 sh src/tools/baseline.sh > baseline.txt      # run inside the FreeBSD VM
 sh src/tools/check_structure.sh              # pre-submission validation
-sh src/tools/make_zip.sh 2024CS10388 <partner-roll>
+sh src/tools/make_zip.sh 2024CS10388 2024AM10224
 ```
 
 ## 9. Protocol error vocabulary

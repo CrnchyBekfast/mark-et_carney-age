@@ -1,22 +1,4 @@
 #!/bin/sh
-# Exchange Server launcher (COL334 A2 §6.0.2).
-#
-#   exec              -> replaces this shell, so experiment.py's
-#                        os.killpg(pid, SIGTERM) reaches the real server
-#                        instead of orphaning it behind a live wrapper.
-#   -u                -> unbuffered stdio, so the trace appears in the
-#                        terminal immediately (that terminal is the evidence
-#                        you screenshot).
-#   $(dirname "$0")   -> CWD-independent; the harness invokes
-#                        ./server/run-server from the submission root, but
-#                        never rely on that.
-#   "$@"              -> pass every argument through (<host> <port>).
-#
-# EXCH_NAIVE=1        -> (artifact T5 only, roadmap §8.4) launches the
-#                        throwaway naive blocking-server control instead of
-#                        the real one, so experiment.py 4 can be re-run
-#                        unmodified against it for direct contrast. Unset
-#                        (the default) -> normal grading path, unaffected.
 if [ -n "$EXCH_NAIVE" ]; then
     exec python3 -u "$(dirname "$0")/../src/naive_server.py" "$@"
 else
