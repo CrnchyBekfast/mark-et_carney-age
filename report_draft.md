@@ -602,20 +602,25 @@ Prediction confirmed. `send_would_block` = **0** for the entire run; `wbuf`
 high-water mark **17 B** (one message) for both subscribers; `queued == sent`
 everywhere.
 
-> **[SCREENSHOT 7a — Run A: `netstat` samples showing the slow client's `Recv-Q`
-> climbing while the reading client stays near zero; `ps -o wchan` = `kqread`]**
+![Screenshot 7a](screenshots/7a.png)
+*Screenshot 7a — six repeated samples of `netstat` and `ps -o wchan` across the
+run: the slow client's `Recv-Q` (port 36953) climbs steadily while the normal
+client (port 62129) stays near zero, and `wchan=kqread` on every sample.*
 
 The slow and normal subscribers are indistinguishable *from the server's
 side* — the divergence appears only in the clients' kernel receive queues:
 
-| sample | normal client `Recv-Q` | slow client `Recv-Q` |
+| sample | normal client `Recv-Q` (port 62129) | slow client `Recv-Q` (port 36953) |
 |---|---|---|
-| ~30 % | 17 | 29,206 |
-| ~50 % | 0 | 45,390 |
-| ~70 % | 0 | 65,008 |
-| ~end | 36 | **82,535** |
+| 1 | 17 | 629 |
+| 2 | 17 | 3,757 |
+| 3 | 0 | 22,083 |
+| 4 | 0 | 34,816 |
+| 5 | 17 | 54,740 |
+| 6 | 0 | 74,834 |
+| 7 | 17 | **83,232** |
 
-`wchan` = `kqread` on all four samples (**W1**).
+`wchan` = `kqread` on all seven samples (**W1**).
 
 ### 8.4 Runs B and D — shrinking the buffers, twice, with no effect
 
@@ -647,8 +652,11 @@ Because two independent attempts to shrink the target failed, we isolated the
 behaviour from the exchange entirely with a ~200-line blaster/victim pair
 (`src/tools/sb_probe.py`) containing no project code.
 
-> **[SCREENSHOT 7b — `sb_probe.py`: the victim's `FIONREAD` climbing past 67 MB
-> with `SO_RCVBUF` pinned at 8192, and the drain-and-count confirming it]**
+![Screenshot 7b](screenshots/7b.png)
+*Screenshot 7b — `sb_probe.py`, default-buffer run, both terminals: the
+victim's `FIONREAD` climbing to 67,108,877 with `SO_RCVBUF` autotuning
+81,720 → 122,580, and the blaster's matching `PATH CAPACITY` result on the
+right — the live run reproduces the table below exactly.*
 
 | | default buffer | `SO_RCVBUF` pinned to 8192 |
 |---|---|---|
@@ -669,8 +677,11 @@ genuinely was buffered.
 peer `SO_RCVBUF` 16,384, with `FIONREAD` flat at 12,985 — textbook flow
 control, and the behaviour FreeBSD is not showing on this path.
 
-> **[SCREENSHOT 7c — the `win 0` direction breakdown: all hits server→trader,
-> zero from the subscriber; and the subscriber's constant `win 320`]**
+![Screenshot 7c](screenshots/7c.png)
+*Screenshot 7c — `exp7e.pcap` filtered to the subscriber's port (12398): the
+opening `win 65535` at the SYN, settling to a constant `win 320` at the first
+post-handshake ACK, and still `win 320` at the very last packet — after
+11,900,004 B absorbed unread.*
 
 **What the wire shows (F3).** `exp7e.pcap` contains **1,630,569** non-RST
 `win 0` packets — and *every one of them* is `server → trader`
@@ -716,8 +727,11 @@ pipelines 700,000 matched pairs with batched writes and no per-trade drain
 draining the trader sockets continuously so they cannot become a second slow
 consumer. **Stock sysctls throughout — no tuning at all.**
 
-> **[SCREENSHOT 7d — `exp7_report.py` output for Run E: the onset, the per-sid
-> table, and the pre/post engine latency split]**
+![Screenshot 7d](screenshots/7d.png)
+*Screenshot 7d — `exp7_report.py` re-run against the preserved Run E trace
+(`exp7e_trace.jsonl`, dated Sep 6 — the same run analyzed throughout this
+section, not a fresh one): onset, per-sid table, and the pre/post engine
+latency split, matching the figures and prose below exactly.*
 
 ```
 events:  queue_out 3,500,003 · engine 1,400,003 · send_would_block 66
@@ -747,12 +761,24 @@ all three, so the backlog was *transient*, not standing — P3 therefore plots
 the difference series rather than two cumulative curves four orders of
 magnitude apart.
 
-> **[FIGURE P1 — per-connection userspace backlog vs time]**
-> **[FIGURE P3 — cumulative queued vs sent, with the backlog as a second panel]**
+![Figure P1](figs/P1_pending.png)
+*Figure P1 — per-connection userspace backlog vs time. The spike to 1,474 B on
+sid 3, aligned with the onset marker, is the only visible departure from a
+flat ~17–23 B baseline across all three connections.*
+
+![Figure P3](figs/P3_queued_sent.png)
+*Figure P3 — cumulative queued vs sent for sid 3 (top panel, the two lines
+overlapping at this scale), and the queued−sent backlog difference on the
+same x-axis (bottom panel) — the same transient spike as P1, now shown
+against the 27 MB of total traffic it is a rounding error within.*
 
 ### 8.7 The result that matters: the engine is decoupled
 
-> **[FIGURE P2 — matching-engine latency across the onset]**
+![Figure P2](figs/P2_engine.png)
+*Figure P2 — matching-engine latency (p50, p99) across the full run. No
+step change at the onset line: the distribution before and after is the
+same shape, which is the positive evidence for decoupling, not merely the
+absence of a negative one.*
 
 | window | n | p50 | p90 | p99 | p99.9 | max |
 |---|---|---|---|---|---|---|
