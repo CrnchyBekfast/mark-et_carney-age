@@ -1,6 +1,6 @@
 # The Socket Exchange — Experiment Report
 
-**COL334 Assignment 2** · Entry number 2024CS10388
+**COL334 Assignment 2** · Amar Sinha (2024CS10388), Ritwik Sehrawat (2024AM10224)
 Implementation: Python 3, `socket` + `select.kqueue()` used directly
 Testbed: FreeBSD 15.1 VM, all traffic over `lo0`
 
