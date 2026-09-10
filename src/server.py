@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+"""single-threaded kqueue tcp server. transport only, typeshi."""
+
 from __future__ import annotations
 
 import os
@@ -14,24 +16,19 @@ import engine
 import protocol
 import tracelog
 
-
-MAX_LINE   = 4096                                         # inbound line cap (§3)
-WBUF_MAX   = int(os.environ.get("EXCH_WBUF_MAX", 4 << 20))   # 4 MiB (§5)
+# config n stuff
+MAX_LINE   = 4096                                            # no giant lines
+WBUF_MAX   = int(os.environ.get("EXCH_WBUF_MAX", 4 << 20))  # slow-client cap
 READ_CHUNK = 65536
 KQ_BATCH   = 256
-BACKLOG    = 4096                       # large for the bonus-track ramp (§10)
+BACKLOG    = 4096                                            # bonus grind
 
 UNTYPED, TRADER, MARKETDATA = 0, 1, 2
 ROLE_NAME = {UNTYPED: "untyped", TRADER: "trader", MARKETDATA: "market-data"}
 
 
 class Conn:
-    """One TCP connection.
-
-    __slots__ is not micro-optimisation here.  It is what keeps a connection
-    near ~250 B instead of ~500 B, which is a bonus-track requirement at
-    70,000 connections (roadmap §10).
-    """
+    """one tcp connection, packed light for the 70k bonus."""
 
     __slots__ = ("sock", "fd", "sid", "role", "user", "subs",
                  "framer", "wbuf", "woff", "wwatch", "dead", "quitting",
@@ -41,16 +38,15 @@ class Conn:
         self.sock     = sock
         self.fd       = sock.fileno()
         self.sid      = sid
-        self.role     = UNTYPED       # inferred from first LOGIN / SUBSCRIBE
+        self.role     = UNTYPED       # guessed from the first command
         self.user     = None
-        self.subs     = 0             # bitmask: JNST=1, IMCT=2
-        self.framer   = None          # lazily created on first recv;
-                                      # framing.py owns the inbound buffer now
-        self.wbuf     = bytearray()   # OUTBOUND BACKLOG -- the whole of Exp 7
-        self.woff     = 0             # consumed prefix (offset, not erase)
-        self.wwatch   = False         # is KQ_FILTER_WRITE currently enabled?
-        self.dead     = False         # reap AFTER the batch, never mid-batch
-        self.quitting = False         # QUIT seen: close once wbuf drains (§2.2.5)
+        self.subs     = 0             # jnst=1, imct=2
+        self.framer   = None          # made on first recv
+        self.wbuf     = bytearray()   # slow-client backlog
+        self.woff     = 0             # sent prefix
+        self.wwatch   = False         # write watch armed or nah
+        self.dead     = False         # close after the batch
+        self.quitting = False         # drain then dip
         self.n_recv   = 0
         self.bytes_in = 0
         self.queued   = 0
@@ -65,23 +61,20 @@ class Conn:
 class Server:
     def __init__(self, host: str, port: int):
         self.host, self.port = host, port
-        self.conns  = {}      # fd  -> Conn
-        self.by_sid = {}      # sid -> Conn   (live sessions only)
-        self.reap   = []      # fds to close AFTER the batch (RULE 1)
-        self.next_sid = 1     # monotonic, NEVER reused -> generation-safe id
+        self.conns  = {}      # fd to connection
+        self.by_sid = {}      # live sid to connection
+        self.reap   = []      # close these after the batch
+        self.next_sid = 1     # fresh forever, no recycled aura
         self.kq = None
         self.ls = None
         self.lfd = -1
-        # Sole authority for order-book, subscription, and username state.
-        # server.py owns transport only (sockets, framing buffers, kqueue);
-        # it never mutates engine-owned collections directly.
+        # engine owns all market state, as it should
         self.engine = engine.Engine()
 
-    # -- setup ------------------------------------------------------------
+    # setup vibes
     def listen(self) -> None:
         ls = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Without SO_REUSEADDR you lose minutes to EADDRINUSE every time a
-        # previous run left connections behind, hundreds of times over 5 days.
+        # reuse the address so restarts don't get cursed
         ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         ls.bind((self.host, self.port))
         ls.listen(BACKLOG)
@@ -98,13 +91,7 @@ class Server:
         self.kq.control([select.kevent(fd, filt, flags)], 0)
 
     def want_write(self, c: Conn, on: bool) -> None:
-        """Enable/disable KQ_FILTER_WRITE.
-
-        KQ_FILTER_WRITE is LEVEL-TRIGGERED: left enabled on an empty buffer it
-        fires continuously and the loop spins at 100% CPU -- visible and
-        damning in Experiment 7's CPU column.  This is the one failure mode of
-        the whole design, so it lives in its own function.
-        """
+        """arm writes only while bytes are waiting."""
         if on == c.wwatch:
             return
         flags = (select.KQ_EV_ADD | select.KQ_EV_ENABLE) if on \
@@ -119,19 +106,17 @@ class Server:
         tracelog.emit("write_enable" if on else "write_disable",
                       sid=c.sid, fd=c.fd, pending=c.pending())
 
-    # -- main loop --------------------------------------------------------
+    # the main event-loop situation
     def run(self) -> None:
         while True:
             try:
-                events = self.kq.control(None, KQ_BATCH, None)   # block forever
-            except InterruptedError:                             # EINTR
+                events = self.kq.control(None, KQ_BATCH, None)   # nap till an event
+            except InterruptedError:                             # signal said hey
                 continue
             except OSError as e:
                 tracelog.emit("kevent_error", errno=e.errno)
                 return
-            # Blocked in kevent() above, which is why `ps -o wchan` reports
-            # kqread and never sbwait.  That one word is the entire
-            # Experiment 4 proof (roadmap §8.4).
+            # kqread means we're waiting on everyone, not one client
 
             for ev in events:
                 fd = ev.ident
@@ -142,11 +127,9 @@ class Server:
 
                 c = self.conns.get(fd)
                 if c is None or c.dead:
-                    continue                      # RULE 1 guard
+                    continue                      # stale event, begone
 
-                # RULE 3: no exception may escape this loop.  In C++ the fatal
-                # trap is SIGPIPE; in Python it is an uncaught exception taking
-                # every client down at once and failing §4.4.
+                # one client bug doesn't get to smoke the server
                 try:
                     if ev.filter == select.KQ_FILTER_READ:
                         self.on_readable(c, ev)
@@ -156,21 +139,19 @@ class Server:
                     self.kill(c, type(e).__name__)
                 except OSError as e:
                     self.kill(c, "errno=%d" % (e.errno or 0))
-                except Exception as e:            # a bug must cost 1 client, not all
+                except Exception as e:            # one client takes the l
                     tracelog.emit("internal_error", sid=c.sid, fd=c.fd,
                                   exc=repr(e))
                     self.kill(c, "internal_error")
 
-            # RULE 1: close() happens ONLY here, outside the batch.  Closing
-            # mid-batch lets the kernel recycle the fd for a new accept() in
-            # this same batch, and a stale event then lands on the wrong Conn.
+            # close after the batch so recycled fds don't haunt us
             for fd in self.reap:
                 self.destroy(fd)
             del self.reap[:]
 
-    # -- accept -----------------------------------------------------------
+    # new connection just dropped
     def on_accept(self) -> None:
-        while True:                               # drain the whole backlog
+        while True:                               # empty the accept queue
             try:
                 cs, peer = self.ls.accept()
             except BlockingIOError:
@@ -185,7 +166,7 @@ class Server:
             except OSError:
                 pass
 
-            sb = os.environ.get("EXCH_SNDBUF")    # Experiment 7 control (§5)
+            sb = os.environ.get("EXCH_SNDBUF")    # slow-client experiment knob
             if sb:
                 try:
                     cs.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, int(sb))
@@ -198,12 +179,7 @@ class Server:
             self.by_sid[c.sid] = c
             self._kq_set(c.fd, select.KQ_FILTER_READ,
                          select.KQ_EV_ADD | select.KQ_EV_ENABLE)
-            # KQ_FILTER_WRITE is registered lazily, only when wbuf is non-empty.
-            # Ground truth for Experiment 7: what the KERNEL says this
-            # socket's buffers actually are, after the optional EXCH_SNDBUF
-            # setsockopt above.  netstat -x's R-HIWA/S-HIWA columns proved
-            # ambiguous (they disagreed with observed Recv-Q), so the
-            # per-socket getsockopt value is recorded instead of inferred.
+            # log the real kernel buffer sizes, no guessing
             try:
                 so_snd = cs.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
                 so_rcv = cs.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF)
@@ -214,7 +190,7 @@ class Server:
                           peer="%s:%d" % peer, nconn=len(self.conns),
                           sndbuf=so_snd, rcvbuf=so_rcv)
 
-    # -- read path --------------------------------------------------------
+    # read path
     def on_readable(self, c: Conn, ev) -> None:
         while True:
             try:
@@ -241,19 +217,12 @@ class Server:
                 return
 
     def handle_readable_bytes(self, c: Conn, data: bytes) -> None:
-        """
-        framer.feed() -> protocol.parse_line() -> engine.handle() ->
-        queue_out(). engine.handle() never touches a socket: its only
-        outbound operation is returning list[(sid, bytes)]. This is the
-        entire mechanism behind Experiment 7 -- TCP backpressure has no
-        path into the matching engine.
-        """
+        """frame it, parse it, run it, queue it. clean separation typeshi."""
         if c.framer is None:
             c.framer = framing.Framer(max_line=MAX_LINE)
 
         before = len(c.framer.buf)
-        lines = list(c.framer.feed(data))     # forces full compaction now,
-                                               # independent of the loop below
+        lines = list(c.framer.feed(data))     # compact now, chill later
         tracelog.emit("recv", sid=c.sid, fd=c.fd, n=len(data),
                       rbuf_before=before, rbuf_after=len(c.framer.buf),
                       lines_out=len(lines), hex=bytes(data[:32]).hex())
@@ -266,18 +235,11 @@ class Server:
                     return
                 continue
 
-            # §2.2.5 -- QUIT requests a *graceful* disconnection.  It is
-            # handled here rather than inside engine.handle(), because the
-            # engine must never learn that connections exist at all: that
-            # invariant is exactly what Experiment 7 rests on.  flush()
-            # performs the actual close once anything already queued for this
-            # client has drained, so a QUIT never truncates output the server
-            # had already promised.
+            # quit drains promised output before dipping
             if payload[0] == b"QUIT":
                 c.quitting = True
                 self.flush(c)
-                return          # anything after QUIT in this batch is
-                                # discarded -- the client asked to leave
+                return          # anything after quit gets ghosted
 
             t0 = time.monotonic_ns()
             results = self.engine.handle(c.sid, payload)
@@ -295,13 +257,11 @@ class Server:
             self.kill(c, "overflow")
             return
 
-    # -- write path: this is the entire Experiment 7 mechanism -------------
+    # write path, aka the slow-client lore
     def queue_out(self, sid: int, msg: bytes) -> None:
         c = self.by_sid.get(sid)
         if c is None or c.dead:
-            # §2.6: a resting order may fill after its owner disconnected.
-            # The trade proceeds, subscribers still get TRADE, and the private
-            # BOUGHT/SOLD is simply dropped.  Implemented by omission.
+            # owner left; the trade lives but their private alert doesn't
             tracelog.emit("notify_dropped", target_sid=sid, msg=msg)
             return
 
@@ -314,40 +274,28 @@ class Server:
                       pending=pend, hwm=c.wbuf_hwm)
 
         if pend > WBUF_MAX:
-            # Slow-consumer eviction: the spec is silent on permanently slow
-            # readers, so the policy is chosen and documented (roadmap §5).
+            # too slow for this timeline
             self.kill(c, "slow_consumer")
             return
 
-        self.flush(c)          # opportunistic; normally completes in one send
+        self.flush(c)          # send now if the kernel's feeling it
 
     def flush(self, c: Conn) -> None:
         while c.woff < len(c.wbuf):
             try:
-                # memoryview slice = no copy.  During Experiment 7 the pending
-                # tail reaches ~72 KB; c.wbuf[c.woff:] would copy it on every
-                # attempt, making the write path O(n^2) and perturbing the very
-                # measurement being taken.
-                #
-                # CAREFUL: this memoryview is deliberately an UNNAMED temporary.
-                # A bytearray cannot be resized while a memoryview of it is
-                # exported, and the compaction below resizes c.wbuf.  As a
-                # temporary it is released during expression cleanup, so the
-                # resize is safe -- but if you ever bind it to a variable you
-                # MUST call .release() before the `del c.wbuf[...]`, or you get
-                # BufferError: Existing exports of data: object cannot be re-sized.
+                # no-copy slice; don't bind the view or compaction gets mad
                 n = c.sock.send(memoryview(c.wbuf)[c.woff:])
             except BlockingIOError:
                 c.eagain += 1
                 tracelog.emit("send_would_block", sid=c.sid, fd=c.fd,
                               pending=c.pending(), eagain=c.eagain)
-                if c.woff * 2 > len(c.wbuf):          # amortised compaction
+                if c.woff * 2 > len(c.wbuf):          # tidy the sent half
                     del c.wbuf[:c.woff]
                     c.woff = 0
                 self.want_write(c, True)
-                return          # engine path returns IMMEDIATELY. Never blocks.
+                return          # kernel said nah, wait for writable
             except (BrokenPipeError, ConnectionResetError):
-                self.kill(c, "peer_gone")             # Experiment 8
+                self.kill(c, "peer_gone")             # peer vanished, tragic
                 return
 
             if n < c.pending():
@@ -359,26 +307,17 @@ class Server:
         c.woff = 0
         self.want_write(c, False)
 
-        # The buffer is now empty.  If a QUIT is pending, this is the moment
-        # the graceful close becomes safe -- everything the client was owed
-        # has reached the kernel.  Reached from both call sites: the inline
-        # flush in handle_readable_bytes, and the KQ_FILTER_WRITE path after
-        # a backlog finally drains.
+        # empty buffer means quit can finally dip
         if c.quitting:
             self.kill(c, "quit")
 
-    # -- teardown ---------------------------------------------------------
+    # cleanup arc
     def kill(self, c: Conn, why: str) -> None:
         if c.dead:
             return
         c.dead = True
 
-        # engine.on_disconnect is the SOLE authority for session/subscription
-        # cleanup (usernames, subs) and for computing the §2.6 proof metric.
-        # It does NOT touch orders/level -- resting orders survive by design.
-        # Role commitment lives in engine.Session, not in Conn -- there is
-        # deliberately no second, parallel copy to drift out of sync.  Read it
-        # BEFORE on_disconnect(), which pops the session.
+        # grab the role before engine deletes the session
         _sess = self.engine.sessions.get(c.sid)
         role_name = ROLE_NAME[_sess.role if _sess is not None else c.role]
 
@@ -390,11 +329,9 @@ class Server:
                       eagain=c.eagain, wbuf_hwm=c.wbuf_hwm,
                       orders_surviving=surviving_orders)
 
-        # Notifications addressed to this sid now drop (see queue_out).
+        # future private alerts to this sid vanish
         self.by_sid.pop(c.sid, None)
-        # subs/usernames cleanup already happened above, inside
-        # engine.on_disconnect() -- it is the sole authority for it.
-        #      and DO NOT touch the order book -- resting orders survive (§2.6).
+        # engine cleaned the identity; resting orders stay
         self.reap.append(c.fd)
 
     def destroy(self, fd: int) -> None:
@@ -402,7 +339,7 @@ class Server:
         if c is None:
             return
         try:
-            c.sock.close()      # closing the fd drops its kqueue registrations
+            c.sock.close()      # closing also drops kqueue watches
         except OSError:
             pass
         tracelog.emit("destroy", sid=c.sid, fd=fd, nconn=len(self.conns))
@@ -423,9 +360,7 @@ def main() -> None:
             % sys.platform)
         raise SystemExit(2)
 
-    # experiment.py's terminate_process() sends SIGTERM to our process group.
-    # Python's DEFAULT SIGTERM action exits without running any cleanup, which
-    # truncates the JSONL trace and loses the tail of every experiment.
+    # save the trace before signals take us out
     def _bye(signo, _frame):
         tracelog.emit("signal", signo=signo)
         tracelog.close()
