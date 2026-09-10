@@ -99,6 +99,22 @@ matched against an anchored `re.fullmatch(rb'[0-9]+')` rather than passed to
 hostage to Nagle. This has a visible consequence in Experiment 7 (below):
 every 17-byte `TRADE` becomes its own segment.
 
+**Graceful `QUIT`, and where `shutdown()` genuinely belongs.** §2.2.5 lists
+`QUIT` for both client roles, and §4.1 requires direct use of `shutdown()`.
+On the client, `QUIT` calls `s.shutdown(socket.SHUT_WR)` rather than
+`close()` — a real half-close, so the socket keeps reading until the server
+closes from its end and nothing already in flight is discarded. On the
+server, `QUIT` is intercepted in `server.py` *before* `engine.handle()` is
+called and is never routed through the engine — the engine must not learn
+that connections exist at all, which is the same invariant Experiment 7
+rests on. If the connection has a userspace backlog, the socket is marked
+`quitting` and the actual close is deferred until `flush()` finishes
+draining it, so a `QUIT` immediately after a large order burst cannot
+truncate replies the client was already owed. This is exercised offline by
+`src/tools/verify_quit.py` (17/17 checks, including the deferred-close case
+under a forced backlog) and cross-checked against the existing Experiment-7
+write-path verifier (19/19, no regression).
+
 ---
 
 ## 2. Experiment 1 — Listening and Connected Sockets
@@ -847,7 +863,19 @@ keeps up, and batches automatically when it does not.
 | **32** | `EPIPE` | not observed | Requires a write in flight at the instant of peer death; `kevent()`-driven detection pre-empts it (§9). Python ignores `SIGPIPE`, so it would surface as `BrokenPipeError`, which `flush()` already handles. |
 | **60** | `ETIMEDOUT` | not observed | Requires a retransmission timeout — a peer that stops responding without RST. Impossible on `lo0`, which has no loss and no path to lose a peer silently. |
 
-### 10.3 Measurement methodology
+### 10.3 Market-Data client commands, completed
+
+§2.8 lists `SUBSCRIBE`, `UNSUBSCRIBE` and `QUIT` as valid Market-Data Client
+messages, but the original client only ever read its socket — it could send
+none of them after the initial connect-time `SUBSCRIBE`s. `market_data.py`
+now multiplexes stdin alongside the socket with the same `select.kqueue()`
+pattern `trader.py` already used, so `UNSUBSCRIBE <instr>` and `QUIT` can be
+typed live. Server-side support for both was already correct and unused;
+this closed the client-side gap. Verified offline: `SUBSCRIBE`+`UNSUBSCRIBE`
+round-trips two `OK`s and removes the session id from `engine.subs`;
+`SUBSCRIBE`+`QUIT` acknowledges first and then closes, per §2.8.
+
+### 10.4 Measurement methodology
 
 Instruments split into two classes, and only one class is timing-sensitive:
 
@@ -891,7 +919,8 @@ EXCH_WBUF_MAX=<bytes>  slow-consumer backlog cap (default 4 MiB)
 EXCH_NAIVE=1           launch the blocking control server (Experiment 4 only)
 ```
 
-Non-submission analysis tools used for Experiment 7 live in `src/tools/`:
+Non-submission analysis tools live in `src/tools/`:
 `exp7_load.py` (volume generator), `exp7_report.py` (trace reducer),
 `exp7_probe.py` and `sb_probe.py` (the isolation diagnostics),
-`exp7_csv.py` + `plot.py` (figures).
+`exp7_csv.py` + `plot.py` (figures), `verify_quit.py` (§2.2.5 offline proof),
+`gapd_concurrency.sh` (§4.3's ≥10-client / ≥2-trader / ≥4-MD requirement).
