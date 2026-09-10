@@ -143,8 +143,9 @@ netstat -an -p tcp | grep 5000
 
 ### Evidence
 
-> **[SCREENSHOT 1a — PENDING RE-CAPTURE: `sockstat` and `netstat` during
-> Experiment 1, taken while the harness is paused in its observation phase]**
+![Screenshot 1a](screenshots/1a.png)
+*Screenshot 1a — `sockstat` and `netstat`, both taken while the harness is
+paused mid-experiment: one `LISTEN` row plus one `ESTABLISHED` pair.*
 
 ```
 $ sockstat -4 | grep 5000
@@ -357,16 +358,12 @@ netstat -an -p tcp | grep 5000
 ### Evidence
 
 ![Screenshot 4a](screenshots/4a.png)
-*Screenshot 4a — real server: Client 2 answered in 0.003 s while Client 1 sits
-mid-message.*
+*Screenshot 4a — real server, captured from a second terminal while Client 2's
+reply is still pending: `ps -o pid,tid,wchan,state` reads `WCHAN=kqread`.*
 
 ![Screenshot 4b](screenshots/4b.png)
-*Screenshot 4b — naive blocking control: Client 2 never answered; the harness
-times out after 5.072 s.*
-
-> **[SCREENSHOT 4c — PENDING RE-CAPTURE: `ps -o pid,tid,wchan,state` for both
-> servers, taken from a second terminal *while* each experiment is paused, so
-> that `kqread` and `sbwait` are actually visible]**
+*Screenshot 4b — naive blocking control, same command, same moment in the
+run: `WCHAN=sbwait`.*
 
 Real server (PID 11326):
 ```
@@ -813,31 +810,38 @@ tcpdump -r exp8.pcap -n -ttt -S | grep 49686
 
 ### Evidence
 
-> **[SCREENSHOT 8a — server trace: `eof_fin` for the killed client, trading continues]**
-> **[SCREENSHOT 8b — `tcpdump` for the killed client's port: normal four-way FIN close]**
+![Screenshot 8a](screenshots/8a.png)
+*Screenshot 8a — the server's own trace at the moment of the kill: `eof_fin`
+for sid 5, then `close{why='FIN', role='market-data', queued=343, sent=343,
+orders_surviving=0}` — nothing it was owed got truncated.*
+
+![Screenshot 8b](screenshots/8b.png)
+*Screenshot 8b — `exp8.pcap` filtered to port 15960 (the killed client, per
+the `accept sid=5 ... peer='127.0.0.1:15960'` line): a normal four-way FIN
+close, indistinguishable from an orderly disconnect.*
 
 ```
-3882.042ms eof_fin sid=5 fd=8 ev_eof=True
-3882.304ms close   sid=5 fd=8 why='FIN' recvs=1 bytes_in=15 queued=343 sent=343
-                   eagain=0 wbuf_hwm=17 orders_surviving=0
-3882.502ms destroy sid=5 fd=8 nconn=3
+3933.263ms eof_fin sid=5 fd=8 ev_eof=True
+3933.490ms close   sid=5 fd=8 why='FIN' role='market-data' recvs=1 bytes_in=15
+                   queued=343 sent=343 eagain=0 wbuf_hwm=17 orders_surviving=0
+3934.054ms destroy sid=5 fd=8 nconn=3
 ```
 
 ```
-49686 > 5000: Flags [.]   ack ...        <- last ACK of a TRADE push
-49686 > 5000: Flags [F.]  seq ...        <- the SIGKILL'd process's FIN
-5000 > 49686: Flags [.]   ack ...           server ACKs
-5000 > 49686: Flags [F.]  seq ...           server's own FIN
-49686 > 5000: Flags [.]   ack ...           client ACKs -- full four-way close
+15960 > 5000: Flags [.]   ack ...        <- last ACK of a TRADE push
+15960 > 5000: Flags [F.]  seq ...        <- the SIGKILL'd process's FIN
+5000 > 15960: Flags [.]   ack ...           server ACKs
+5000 > 15960: Flags [F.]  seq ...           server's own FIN
+15960 > 5000: Flags [.]   ack ...           client ACKs -- full four-way close
 ```
 
 **Table T10**
 
 | time | event | wire | server observation | server action |
 |---|---|---|---|---|
-| 3882.042 ms | client `SIGKILL`ed | `[F.]` from 49686 | `eof_fin{ev_eof=True}` | mark dead |
-| +0.26 ms | — | `[.]` then `[F.]` from server | `close{orders_surviving=0}` | teardown |
-| +0.46 ms | — | client `[.]` | `destroy{nconn=3}` | reap fd |
+| 3933.263 ms | client `SIGKILL`ed | `[F.]` from 15960 | `eof_fin{ev_eof=True}` | mark dead |
+| +0.23 ms | — | `[.]` then `[F.]` from server | `close{orders_surviving=0}` | teardown |
+| +0.56 ms | — | client `[.]` | `destroy{nconn=3}` | reap fd |
 | through 8314 ms | trading continues | `TRADE` pushes to sid 2 | — | unaffected |
 
 This is byte-for-byte the same shape as Experiment 6 Part A's orderly close —
